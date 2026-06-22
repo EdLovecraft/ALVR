@@ -206,7 +206,7 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
         m_rateControlMode: video.encoder_config.rate_control_mode as u32,
         m_fillerData: video.encoder_config.filler_data,
         m_entropyCoding: video.encoder_config.entropy_coding as u32,
-        m_force_sw_encoding: video.encoder_config.software.force_software_encoding,
+        m_forceSwEncoding: video.encoder_config.software.force_software_encoding,
         m_swThreadCount: video.encoder_config.software.thread_count,
         m_nvencTuningPreset: nvenc.tuning_preset as u32,
         m_nvencMultiPass: nvenc.multi_pass as u32,
@@ -227,18 +227,18 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
         m_nvencEnableWeightedPrediction: nvenc.enable_weighted_prediction,
         m_minimumIdrIntervalMs: settings.connection.minimum_idr_interval_ms,
         m_enableViveTrackerProxy: settings.headset.enable_vive_tracker_proxy,
-        m_TrackingRefOnly: settings.headset.tracking_ref_only,
+        m_trackingRefOnly: settings.headset.tracking_ref_only,
         m_enableLinuxVulkanAsyncCompute: settings.extra.patches.linux_async_compute,
         m_enableLinuxAsyncReprojection: settings.extra.patches.linux_async_reprojection,
         m_enableControllers: controllers_enabled,
-        m_controllerIsTracker: controller_is_tracker as i32,
-        m_enableBodyTrackingFakeVive: body_tracking_vive_enabled as i32,
-        m_bodyTrackingHasLegs: body_tracking_has_legs as i32,
+        m_controllerIsTracker: controller_is_tracker,
+        m_enableBodyTrackingFakeVive: body_tracking_vive_enabled,
+        m_bodyTrackingHasLegs: body_tracking_has_legs,
         m_useSeparateHandTrackers: use_separate_hand_trackers,
     }
 }
 
-fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
+fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
     thread::spawn(move || {
         if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
             context.start_connection();
@@ -749,7 +749,7 @@ pub unsafe extern "C" fn HmdDriverFactory(
 
         *SERVER_CORE_CONTEXT.write() = Some(context);
 
-        event_loop(events_receiver);
+        spawn_event_loop(events_receiver);
     });
 
     unsafe { CppOpenvrEntryPoint(interface_name, return_code) }
