@@ -9,6 +9,28 @@ use std::{
 const FULL_REPORT_INTERVAL: Duration = Duration::from_millis(500);
 const EPS_INTERVAL: Duration = Duration::from_micros(1);
 
+fn frame_pacing_wait_duration(
+    last_vsync_time: &mut Instant,
+    frame_interval: Duration,
+    now: Instant,
+) -> Duration {
+    let next_vsync_time = *last_vsync_time + frame_interval;
+
+    if next_vsync_time <= now {
+        // The producer missed its pacing deadline. Waiting for the following deadline here would
+        // quantize any framerate below the refresh rate to an integer divisor (for example, a
+        // slightly late 90 Hz frame would be delayed until the 45 Hz slot). Let the late frame
+        // through immediately and start a new pacing phase from it instead.
+        *last_vsync_time = now;
+
+        Duration::ZERO
+    } else {
+        *last_vsync_time = next_vsync_time;
+
+        next_vsync_time - now
+    }
+}
+
 pub struct HistoryFrame {
     target_timestamp: Duration,
     tracking_received: Instant,
@@ -298,13 +320,98 @@ impl StatisticsManager {
 
     // NB: this call is non-blocking, waiting should be done externally
     pub fn duration_until_next_vsync(&mut self) -> Duration {
-        let now = Instant::now();
+        frame_pacing_wait_duration(
+            &mut self.last_vsync_time,
+            self.frame_interval,
+            Instant::now(),
+        )
+    }
+}
 
-        // update the last vsync if it's too old
-        while self.last_vsync_time + self.frame_interval < now {
-            self.last_vsync_time += self.frame_interval;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_pacing_waits_for_an_on_time_frame() {
+        let frame_interval = Duration::from_millis(10);
+        let start = Instant::now();
+        let mut last_vsync_time = start;
+
+        let wait = frame_pacing_wait_duration(
+            &mut last_vsync_time,
+            frame_interval,
+            start + Duration::from_millis(4),
+        );
+
+        assert_eq!(wait, Duration::from_millis(6));
+        assert_eq!(last_vsync_time, start + frame_interval);
+    }
+
+    #[test]
+    fn frame_pacing_does_not_wait_after_missing_a_deadline() {
+        let frame_interval = Duration::from_millis(10);
+        let start = Instant::now();
+        let late_frame_time = start + Duration::from_millis(12);
+        let mut last_vsync_time = start;
+
+        let wait =
+            frame_pacing_wait_duration(&mut last_vsync_time, frame_interval, late_frame_time);
+
+        assert_eq!(wait, Duration::ZERO);
+        assert_eq!(last_vsync_time, late_frame_time);
+    }
+
+    #[test]
+    fn frame_pacing_relocks_after_a_late_frame() {
+        let frame_interval = Duration::from_millis(10);
+        let start = Instant::now();
+        let late_frame_time = start + Duration::from_millis(12);
+        let next_frame_time = late_frame_time + Duration::from_millis(4);
+        let mut last_vsync_time = start;
+
+        assert_eq!(
+            frame_pacing_wait_duration(&mut last_vsync_time, frame_interval, late_frame_time,),
+            Duration::ZERO
+        );
+        assert_eq!(
+            frame_pacing_wait_duration(&mut last_vsync_time, frame_interval, next_frame_time,),
+            Duration::from_millis(6)
+        );
+    }
+
+    #[test]
+    fn frame_pacing_does_not_quantize_continuously_late_120_hz_frames() {
+        let frame_interval = Duration::from_secs_f32(1.0 / 120.0);
+        let start = Instant::now();
+        let mut last_vsync_time = start;
+
+        for frame_index in 1..=5 {
+            let frame_time = start + Duration::from_millis(9 * frame_index);
+
+            assert_eq!(
+                frame_pacing_wait_duration(&mut last_vsync_time, frame_interval, frame_time,),
+                Duration::ZERO
+            );
+            assert_eq!(last_vsync_time, frame_time);
         }
+    }
 
-        (self.last_vsync_time + self.frame_interval).saturating_duration_since(now)
+    #[test]
+    fn frame_pacing_keeps_a_stable_deadline_for_early_frames() {
+        let frame_interval = Duration::from_millis(10);
+        let start = Instant::now();
+        let mut last_vsync_time = start;
+
+        for frame_index in 0_u32..5 {
+            let expected_deadline = start + frame_interval * (frame_index + 1);
+            let frame_time = expected_deadline - Duration::from_millis(4);
+
+            assert_eq!(
+                frame_pacing_wait_duration(&mut last_vsync_time, frame_interval, frame_time,),
+                Duration::from_millis(4)
+            );
+            assert_eq!(last_vsync_time, expected_deadline);
+        }
     }
 }
