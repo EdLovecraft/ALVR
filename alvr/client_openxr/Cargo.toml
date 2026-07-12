@@ -145,6 +145,10 @@ value = "HIGH"
 [[package.metadata.android.application.meta_data]]
 name = "com.oculus.handtracking.version"
 value = "V2.0"
+# Enable Meta FrameSync (Horizon OS v201+ opt-in; default on Store apps from v203)
+[[package.metadata.android.application.meta_data]]
+name = "com.oculus.enable_frame_sync"
+value = "true"
 
 # Vive entries
 [[package.metadata.android.uses_feature]]

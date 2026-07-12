@@ -727,7 +727,7 @@ If you want to reduce the amount of pixelation on the edges, increase the center
 
     #[cfg_attr(not(target_os = "windows"), schema(flag = "hidden"))]
     #[schema(strings(
-        help = r"This works only on Windows. It shouldn't be disabled except in certain circumstances when you know the VR game will not meet the target framerate."
+        help = r"This works only on Windows. Frames that finish before the next display deadline are paced to the headset refresh rate. Late frames are submitted immediately to avoid dropping to an integer divisor of the target framerate."
     ))]
     #[schema(flag = "real-time")]
     pub enforce_server_frame_pacing: bool,

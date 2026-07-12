@@ -656,25 +656,34 @@ extern "C" fn wait_for_vsync() {
     // any weird ideas about our display Hz with its frame pacing.
     static PRE_HEADSET_STATS_WAIT_INTERVAL: Duration = Duration::from_millis(8);
 
-    // NB: don't sleep while locking SERVER_DATA_MANAGER or SERVER_CORE_CONTEXT
-    let sleep_duration = SERVER_CORE_CONTEXT
-        .read()
-        .as_ref()
-        .and_then(|ctx| ctx.duration_until_next_vsync());
+    if SERVER_CORE_CONTEXT.read().is_none() {
+        // The server context may not exist yet during startup or may already be gone during
+        // shutdown. Keep a bounded wait in those transitions even when pacing is disabled.
+        thread::sleep(PRE_HEADSET_STATS_WAIT_INTERVAL);
+        return;
+    }
 
-    if let Some(duration) = sleep_duration {
-        if alvr_server_core::settings()
-            .video
-            .enforce_server_frame_pacing
-        {
-            thread::sleep(duration);
+    if alvr_server_core::settings()
+        .video
+        .enforce_server_frame_pacing
+    {
+        // NB: don't sleep while locking SERVER_DATA_MANAGER or SERVER_CORE_CONTEXT
+        let sleep_duration = SERVER_CORE_CONTEXT
+            .read()
+            .as_ref()
+            .and_then(|ctx| ctx.duration_until_next_vsync());
+
+        if let Some(duration) = sleep_duration {
+            if !duration.is_zero() {
+                thread::sleep(duration);
+            }
         } else {
-            thread::yield_now();
+            // StatsManager isn't up because the headset hasn't connected, safety fallback to
+            // prevent deadlocking.
+            thread::sleep(PRE_HEADSET_STATS_WAIT_INTERVAL);
         }
     } else {
-        // StatsManager isn't up because the headset hasn't connected,
-        // safety fallback to prevent deadlocking.
-        thread::sleep(PRE_HEADSET_STATS_WAIT_INTERVAL);
+        thread::yield_now();
     }
 }
 

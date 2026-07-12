@@ -31,6 +31,7 @@ use std::{
 };
 
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+const HIGH_REFRESH_RATE_MAX_FRAME_INTERVAL: Duration = Duration::from_millis(9);
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -343,17 +344,29 @@ impl StreamContext {
         vsync_time: Duration,
     ) -> (ProjectionLayerBuilder<'_>, Duration) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
-        let frame_poll_deadline = Instant::now()
-            + Duration::from_secs_f32(
-                frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
-            );
-        let mut frame_result = None;
-        if let Some((_, source)) = &mut self.decoder {
-            while frame_result.is_none() && Instant::now() < frame_poll_deadline {
-                frame_result = source.get_frame();
-                thread::sleep(Duration::from_micros(500));
+        let frame_result = if frame_interval <= HIGH_REFRESH_RATE_MAX_FRAME_INTERVAL {
+            // At 120 Hz the previous 0.8-frame polling window could consume 6.67 ms after
+            // xrWaitFrame(), leaving too little time for rendering and xrEndFrame(). Do a
+            // non-blocking dequeue instead: if no new frame is ready, submit the previous image on
+            // time and leave a slightly late decoded frame available for a following cycle.
+            self.decoder
+                .as_mut()
+                .and_then(|(_, source)| source.get_frame())
+        } else {
+            let frame_poll_deadline = Instant::now()
+                + Duration::from_secs_f32(
+                    frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
+                );
+            let mut frame_result = None;
+            if let Some((_, source)) = &mut self.decoder {
+                while frame_result.is_none() && Instant::now() < frame_poll_deadline {
+                    frame_result = source.get_frame();
+                    thread::sleep(Duration::from_micros(500));
+                }
             }
-        }
+
+            frame_result
+        };
 
         let (timestamp, view_params, buffer_ptr) =
             if let Some((timestamp, buffer_ptr)) = frame_result {
