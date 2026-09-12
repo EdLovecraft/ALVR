@@ -15,10 +15,10 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
-use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
+use alvr_packets::{ClientStreamConfig, FoveatedEncodingParams, RealTimeConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
-    FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
+    MediacodecProperty, PassthroughMode, UpscalingConfig,
 };
 use alvr_system_info::Platform;
 use openxr as xr;
@@ -39,7 +39,7 @@ pub struct ParsedStreamConfig {
     pub encoding_gamma: f32,
     pub enable_hdr: bool,
     pub passthrough: Option<PassthroughMode>,
-    pub foveated_encoding_config: Option<FoveatedEncodingConfig>,
+    pub foveated_encoding_config: Option<FoveatedEncodingParams>,
     pub clientside_foveation_config: Option<ClientsideFoveationConfig>,
     pub clientside_post_processing: Option<ClientsidePostProcessingConfig>,
     pub upscaling: Option<UpscalingConfig>,
@@ -58,11 +58,7 @@ impl ParsedStreamConfig {
             encoding_gamma: config.negotiated_config.encoding_gamma,
             enable_hdr: config.negotiated_config.enable_hdr,
             passthrough: config.settings.video.passthrough.as_option().cloned(),
-            foveated_encoding_config: config
-                .negotiated_config
-                .enable_foveated_encoding
-                .then(|| config.settings.video.foveated_encoding.as_option().cloned())
-                .flatten(),
+            foveated_encoding_config: config.negotiated_config.foveated_encoding,
             clientside_foveation_config: config
                 .settings
                 .video
@@ -193,7 +189,7 @@ impl StreamContext {
                     .collect(),
             ],
             format,
-            config.foveated_encoding_config.clone(),
+            config.foveated_encoding_config,
             !((core_ctx.platform().is_pico()
                 || (core_ctx.platform() == Platform::SamsungGalaxyXR))
                 && config.enable_hdr),
@@ -448,6 +444,7 @@ impl StreamContext {
                 },
             ],
             self.config.passthrough.as_ref(),
+            None,
         );
 
         self.swapchains[0].release_image().unwrap();
