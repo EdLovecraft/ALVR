@@ -1,4 +1,5 @@
 mod body;
+mod eye_gaze;
 mod face;
 mod vmc;
 
@@ -15,7 +16,7 @@ use crate::{
 use alvr_common::{
     ConnectionError, DEVICE_ID_TO_PATH, DeviceMotion, Pose, ViewParams,
     glam::{Quat, Vec3},
-    inputs as inp,
+    inputs as inp, warn,
 };
 use alvr_events::{EventType, TrackingEvent};
 use alvr_packets::TrackingData;
@@ -24,6 +25,7 @@ use alvr_session::{
     settings_schema::Switch,
 };
 use alvr_sockets::StreamReceiver;
+use eye_gaze::EyeGazeReceiver;
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
@@ -53,6 +55,7 @@ pub struct TrackingManager {
     inverse_recentering_origin: Pose, // client's reference space
     device_motions_history: HashMap<u64, VecDeque<(Duration, DeviceMotion)>>,
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
+    combined_eye_gaze_history: VecDeque<(Duration, Option<Quat>)>,
     max_history_size: usize,
 }
 
@@ -63,6 +66,7 @@ impl TrackingManager {
             inverse_recentering_origin: Pose::IDENTITY,
             device_motions_history: HashMap::new(),
             hand_skeletons_history: [VecDeque::new(), VecDeque::new()],
+            combined_eye_gaze_history: VecDeque::new(),
             max_history_size,
         }
     }
@@ -254,6 +258,22 @@ impl TrackingManager {
             .map(|(_, skeleton)| skeleton)
     }
 
+    pub fn report_combined_eye_gaze(&mut self, timestamp: Duration, gaze: Option<Quat>) {
+        self.combined_eye_gaze_history.push_back((timestamp, gaze));
+
+        if self.combined_eye_gaze_history.len() > self.max_history_size {
+            self.combined_eye_gaze_history.pop_front();
+        }
+    }
+
+    pub fn get_combined_eye_gaze(&self, sample_timestamp: Duration) -> Option<Quat> {
+        // Use the first retained sample for an exact timestamp, including missing gaze.
+        self.combined_eye_gaze_history
+            .iter()
+            .find(|(timestamp, _)| *timestamp == sample_timestamp)
+            .and_then(|(_, gaze)| *gaze)
+    }
+
     pub fn unrecenter_view_params(&self, view_params: &mut [ViewParams; 2]) {
         for params in view_params {
             params.pose = self.inverse_recentering_origin.inverse() * params.pose;
@@ -282,12 +302,27 @@ pub fn tracking_loop(
                 )
             });
 
+    let eye_tracking_osc_port = initial_settings
+        .headset
+        .face_tracking
+        .as_option()
+        .and_then(|config| config.eye_tracking_osc_override.as_option())
+        .map(|config| config.port);
+    let mut eye_gaze_receiver = eye_tracking_osc_port.and_then(|port| {
+        EyeGazeReceiver::new(port)
+            .inspect_err(|error| warn!("Failed to bind external gaze OSC port {port}: {error}"))
+            .ok()
+    });
+
     let mut face_tracking_sink = initial_settings
         .headset
         .face_tracking
         .into_option()
+        .and_then(|config| config.sink.social_presence.into_option())
         .and_then(|config| {
-            FaceTrackingSink::new(config.sink, initial_settings.connection.osc_local_port).ok()
+            FaceTrackingSink::new(config, initial_settings.connection.osc_local_port)
+                .inspect_err(|error| warn!("Failed to initialize social presence sink: {error}"))
+                .ok()
         });
 
     let mut body_tracking_sink = initial_settings
@@ -315,6 +350,25 @@ pub fn tracking_loop(
         };
 
         let timestamp = tracking.poll_timestamp;
+
+        if eye_tracking_osc_port.is_some() {
+            // Select one eye input before foveation and social output consume it. Do not fall
+            // back to headset eyes when OSC input is missing, invalid or unavailable.
+            tracking.face.eyes_social = [None; 2];
+            tracking.face.eyes_combined = if let Some(receiver) = &mut eye_gaze_receiver {
+                match receiver.receive(timestamp) {
+                    Ok(gaze) => gaze,
+                    Err(error) => {
+                        warn!("External gaze OSC receiver stopped: {error}");
+                        eye_gaze_receiver = None;
+
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        }
 
         if let Some(stats) = &mut *ctx.statistics_manager.write() {
             stats.report_tracking_received(timestamp);
@@ -374,6 +428,8 @@ pub fn tracking_loop(
             if let Some(skeleton) = tracking.hand_skeletons[1] {
                 tracking_manager_lock.report_hand_skeleton(HandType::Right, timestamp, skeleton);
             }
+
+            tracking_manager_lock.report_combined_eye_gaze(timestamp, tracking.face.eyes_combined);
 
             if let Some(sink) = &mut face_tracking_sink {
                 sink.send_tracking(&tracking.face);

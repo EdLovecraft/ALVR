@@ -148,13 +148,15 @@ pub struct InteractionSourcesConfig {
 
 impl InteractionSourcesConfig {
     pub fn new(config: &ClientStreamConfig) -> Self {
+        let face_tracking = config.settings.headset.face_tracking.as_option();
+        let eye_tracking_osc_override =
+            face_tracking.is_some_and(|c| c.eye_tracking_osc_override.enabled());
+
         Self {
-            face_tracking: config
-                .settings
-                .headset
-                .face_tracking
-                .as_option()
-                .map(|c| c.sources.clone()),
+            face_tracking: face_tracking.map(|c| c.sources.clone()).filter(|sources| {
+                !eye_tracking_osc_override
+                    || *sources == FaceTrackingSourcesConfig::PreferFullFaceTracking
+            }),
             body_tracking: config
                 .settings
                 .headset
@@ -393,17 +395,6 @@ impl InteractionContext {
 
         let eyes_combined =
             if extra_extensions::supports_eye_gaze_interaction(&xr_session, xr_system) {
-                if matches!(platform, Platform::QuestPro) {
-                    #[cfg(target_os = "android")]
-                    alvr_system_info::try_get_permission("com.oculus.permission.EYE_TRACKING");
-                } else if matches!(
-                    platform,
-                    Platform::PicoNeo3 | Platform::Pico4Pro | Platform::Pico4Enterprise
-                ) {
-                    #[cfg(target_os = "android")]
-                    alvr_system_info::try_get_permission("com.picovr.permission.EYE_TRACKING");
-                }
-
                 let action = action_set
                     .create_action("combined_eye_gaze", "Combined eye gaze", &[])
                     .unwrap();
@@ -962,25 +953,50 @@ pub fn update_buttons(
     button_entries
 }
 
-// Note: Using the headset view space in order to get heading-independent eye gazes
+// Return native combined and per-eye social gazes separately, both in head-local space.
+// For foveation, the server prefers combined gaze and only derives a common gaze from
+// the social pair when native combined gaze is absent.
 pub fn get_face_data(
     xr_session: &xr::Session<xr::OpenGlEs>,
+    platform: Platform,
     sources: &FaceSources,
+    stage_reference_space: &xr::Space,
     view_reference_space: &xr::Space,
+    head_orientation: Quat,
     time: Duration,
 ) -> FaceData {
     let xr_time = crate::to_xr_time(time);
+    // On the tested PICO 4 Pro, locating gaze in VIEW space returned an identity rotation.
+    // For the PICO models below, use STAGE space and remove the head rotation from the
+    // same sampling time to recover head-local gaze.
+    let pico_eye_gaze_workaround = matches!(
+        platform,
+        Platform::PicoNeo3 | Platform::Pico4Pro | Platform::Pico4Enterprise
+    );
 
     let eyes_combined = if let Some((action, space)) = &sources.eyes_combined
         && action
             .is_active(xr_session, xr::Path::NULL)
             .unwrap_or(false)
-        && let Ok(location) = space.locate(view_reference_space, xr_time)
+        && let Ok(location) = space.locate(
+            if pico_eye_gaze_workaround {
+                stage_reference_space
+            } else {
+                view_reference_space
+            },
+            xr_time,
+        )
         && location
             .location_flags
             .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
     {
-        Some(crate::from_xr_quat(location.pose.orientation))
+        let orientation = crate::from_xr_quat(location.pose.orientation);
+
+        Some(if pico_eye_gaze_workaround {
+            head_orientation.inverse() * orientation
+        } else {
+            orientation
+        })
     } else {
         None
     };
