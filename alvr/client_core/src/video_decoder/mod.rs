@@ -41,9 +41,19 @@ pub struct VideoDecoderSource {
 impl VideoDecoderSource {
     /// If a frame is available, return the timestamp and the AHardwareBuffer.
     pub fn get_frame(&mut self) -> Option<(Duration, *mut std::ffi::c_void)> {
+        self.get_frame_timeout(Duration::ZERO)
+    }
+
+    /// Same as [`Self::get_frame`], but if no frame is ready, wait up to `timeout` for the decoder
+    /// to produce one.
+    #[allow(unused_variables)]
+    pub fn get_frame_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Option<(Duration, *mut std::ffi::c_void)> {
         #[cfg(target_os = "android")]
         {
-            self.inner.dequeue_frame()
+            self.inner.dequeue_frame_timeout(timeout)
         }
         #[cfg(not(target_os = "android"))]
         None
