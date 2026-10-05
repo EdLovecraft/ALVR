@@ -90,6 +90,7 @@ pub struct VideoDecoderSource {
     running: Arc<RelaxedAtomic>,
     dequeue_thread: Option<JoinHandle<()>>,
     image_queue: Arc<Mutex<VecDeque<QueuedImage>>>,
+    frame_available: Arc<Condvar>,
     config: VideoDecoderConfig,
     buffering_running_average: f32,
 }
@@ -97,8 +98,9 @@ pub struct VideoDecoderSource {
 unsafe impl Send for VideoDecoderSource {}
 
 impl VideoDecoderSource {
-    // The application MUST finish using the returned buffer before calling this function again
-    pub fn dequeue_frame(&mut self) -> Option<(Duration, *mut c_void)> {
+    // If no frame is ready, wait up to `timeout` for the decoder to produce one. The application
+    // MUST finish using the returned buffer before calling this function again.
+    pub fn dequeue_frame_timeout(&mut self, timeout: Duration) -> Option<(Duration, *mut c_void)> {
         let mut image_queue_lock = self.image_queue.lock();
 
         if let Some(queued_image) = image_queue_lock.front()
@@ -106,6 +108,16 @@ impl VideoDecoderSource {
         {
             // image is released and ready to be reused by the decoder
             image_queue_lock.pop_front();
+        }
+
+        if image_queue_lock.is_empty() {
+            // The caller has to submit a layer at every vsync even when the decoder is late, so
+            // the wait is bounded and a timeout is not an error.
+            self.frame_available.wait_while_for(
+                &mut image_queue_lock,
+                |image_queue| image_queue.is_empty(),
+                timeout,
+            );
         }
 
         // use running average to give more weight to recent samples
@@ -198,6 +210,7 @@ fn decoder_lifecycle(
     decoder_sink: Arc<Mutex<Option<SharedMediaCodec>>>,
     decoder_ready_notifier: Arc<Condvar>,
     image_queue: Arc<Mutex<VecDeque<QueuedImage>>>,
+    frame_available: Arc<Condvar>,
     image_reader: &mut ImageReader,
 ) -> Result<()> {
     // 2x: keep the target buffering in the middle of the max amount of queuable frames
@@ -205,6 +218,7 @@ fn decoder_lifecycle(
 
     image_reader.set_image_listener(Box::new({
         let image_queue = Arc::clone(&image_queue);
+        let frame_available = Arc::clone(&frame_available);
         move |image_reader| {
             let mut image_queue_lock = image_queue.lock();
 
@@ -226,6 +240,8 @@ fn decoder_lifecycle(
                         image,
                         in_use: false,
                     });
+
+                    frame_available.notify_one();
                 }
                 Ok(e) => {
                     error!("ImageReader error: {e:?}");
@@ -358,6 +374,7 @@ pub fn video_decoder_split(
     let decoder_sink = Arc::new(Mutex::new(None::<SharedMediaCodec>));
     let decoder_ready_notifier = Arc::new(Condvar::new());
     let image_queue = Arc::new(Mutex::new(VecDeque::<QueuedImage>::new()));
+    let frame_available = Arc::new(Condvar::new());
 
     let dequeue_thread = thread::spawn({
         let config = config.clone();
@@ -365,6 +382,7 @@ pub fn video_decoder_split(
         let decoder_sink = Arc::clone(&decoder_sink);
         let decoder_ready_notifier = Arc::clone(&decoder_ready_notifier);
         let image_queue = Arc::clone(&image_queue);
+        let frame_available = Arc::clone(&frame_available);
         move || {
             const MAX_BUFFERING_FRAMES: usize = 10;
             let mut image_reader = match ImageReader::new_with_usage(
@@ -391,6 +409,7 @@ pub fn video_decoder_split(
                 decoder_sink,
                 decoder_ready_notifier,
                 Arc::clone(&image_queue),
+                frame_available,
                 &mut image_reader,
             ) {
                 frame_result_callback(Err(e));
@@ -418,6 +437,7 @@ pub fn video_decoder_split(
         running,
         dequeue_thread: Some(dequeue_thread),
         image_queue,
+        frame_available,
         config,
         buffering_running_average: 0.0,
     };
