@@ -578,11 +578,12 @@ pub extern "C" fn alvr_report_present(timestamp_ns: u64, offset_ns: u64) {
     }
 }
 
-/// Return true if a valid value is provided
+/// Return true if a valid value is provided. NB: this claims the next vsync slot, it is not a
+/// query; see `StatisticsManager::claim_next_vsync_slot`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alvr_duration_until_next_vsync(out_ns: *mut u64) -> bool {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read()
-        && let Some(duration) = context.duration_until_next_vsync()
+        && let Some(duration) = context.claim_next_vsync_slot()
     {
         unsafe { *out_ns = duration.as_nanos() as u64 };
 

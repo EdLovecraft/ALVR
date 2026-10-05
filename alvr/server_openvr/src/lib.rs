@@ -720,9 +720,11 @@ extern "C" fn wait_for_vsync() {
         let sleep_duration = SERVER_CORE_CONTEXT
             .read()
             .as_ref()
-            .and_then(|ctx| ctx.duration_until_next_vsync());
+            .and_then(|ctx| ctx.claim_next_vsync_slot());
 
         if let Some(duration) = sleep_duration {
+            // A frame that missed its slot is submitted immediately, so a zero wait must not turn
+            // into a system call.
             if !duration.is_zero() {
                 thread::sleep(duration);
             }

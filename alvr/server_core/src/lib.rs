@@ -531,14 +531,14 @@ impl ServerCoreContext {
             );
     }
 
-    pub fn duration_until_next_vsync(&self) -> Option<Duration> {
-        dbg_server_core!("duration_until_next_vsync");
+    pub fn claim_next_vsync_slot(&self) -> Option<Duration> {
+        dbg_server_core!("claim_next_vsync_slot");
 
         self.connection_context
             .statistics_manager
             .write()
             .as_mut()
-            .map(|stats| stats.duration_until_next_vsync())
+            .map(|stats| stats.claim_next_vsync_slot())
     }
 }
 
