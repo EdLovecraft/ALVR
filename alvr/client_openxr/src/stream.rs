@@ -32,9 +32,26 @@ use std::{
 
 // Time reserved after the frame dequeue for rendering and calling xrEndFrame(). Waiting for a
 // decoded frame must not eat into it: if the layer isn't submitted before the compositor takes
-// over, the frame is shown a cycle late anyway. At 120 Hz the interval is shorter than this
-// budget, so the wait degenerates into a single non-blocking dequeue attempt.
-const MIN_RENDER_BUDGET: Duration = Duration::from_millis(9);
+// over, the frame is shown a cycle late anyway.
+const MIN_RENDER_BUDGET: Duration = Duration::from_millis(6);
+
+fn decoder_wait_timeout(
+    frame_interval: Duration,
+    vsync_time: Duration,
+    xr_now: Option<Duration>,
+) -> Duration {
+    if let Some(now) = xr_now {
+        // The predicted display time and current time share OpenXR's clock. The display period
+        // alone does not tell us how much time remains after xrWaitFrame() and xrBeginFrame().
+        // Bound the wait to one period even if the runtime predicts a display further ahead.
+        vsync_time
+            .saturating_sub(now)
+            .saturating_sub(MIN_RENDER_BUDGET)
+            .min(frame_interval)
+    } else {
+        frame_interval.saturating_sub(MIN_RENDER_BUDGET)
+    }
+}
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -346,10 +363,15 @@ impl StreamContext {
         vsync_time: Duration,
     ) -> (ProjectionLayerBuilder<'_>, Duration) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
-        // If the decoder doesn't produce a frame before the render budget is used up, give up on
-        // it: the previous image is submitted on time and the late frame is left to a later cycle.
         let frame_result = self.decoder.as_mut().and_then(|(_, source)| {
-            source.get_frame_timeout(frame_interval.saturating_sub(MIN_RENDER_BUDGET))
+            // Sample the runtime clock immediately before waiting, preserving time for rendering
+            // and xrEndFrame(). A zero timeout still dequeues an already available frame.
+            let timeout = decoder_wait_timeout(
+                frame_interval,
+                vsync_time,
+                crate::xr_runtime_now(self.xr_session.instance()).map(crate::from_xr_time),
+            );
+            source.get_frame_timeout(timeout)
         });
 
         let (timestamp, frame_metadata, buffer_ptr) =
@@ -538,7 +560,7 @@ fn stream_input_loop(
     let mut last_view_params = [ViewParams::DUMMY; 2];
 
     let mut deadline = Instant::now();
-    let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
+    let poll_interval = Duration::from_secs_f32(1.0 / (refresh_rate * 3.0));
     while running.value() {
         let int_ctx_lock = interaction_ctx.read();
         let int_ctx = &*int_ctx_lock;
@@ -666,7 +688,77 @@ fn stream_input_loop(
             core_ctx.send_buttons(button_entries);
         }
 
-        deadline += frame_interval / 3;
-        thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        deadline += poll_interval;
+        let now = Instant::now();
+        if deadline > now {
+            thread::sleep(deadline - now);
+        } else {
+            // Re-anchor after a stall so we don't send a back-to-back burst of tracking packets.
+            deadline = now;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_wait_uses_remaining_display_time_at_120_hz() {
+        let frame_interval = Duration::from_secs_f32(1.0 / 120.0);
+        let now = Duration::from_secs(100);
+
+        // The same refresh rate can leave different amounts of time after xrWaitFrame().
+        assert_eq!(
+            decoder_wait_timeout(frame_interval, now + Duration::from_millis(8), Some(now)),
+            Duration::from_millis(2)
+        );
+        assert_eq!(
+            decoder_wait_timeout(frame_interval, now + Duration::from_millis(12), Some(now)),
+            Duration::from_millis(6)
+        );
+    }
+
+    #[test]
+    fn decoder_wait_stops_when_only_render_time_remains() {
+        let frame_interval = Duration::from_secs_f32(1.0 / 120.0);
+        let vsync_time = Duration::from_secs(100);
+
+        for now in [
+            vsync_time - Duration::from_millis(6),
+            vsync_time - Duration::from_millis(4),
+            vsync_time,
+            vsync_time + Duration::from_millis(4),
+        ] {
+            assert_eq!(
+                decoder_wait_timeout(frame_interval, vsync_time, Some(now)),
+                Duration::ZERO
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_wait_is_bounded_when_display_is_far_ahead() {
+        let frame_interval = Duration::from_secs_f32(1.0 / 120.0);
+        let now = Duration::from_secs(100);
+
+        assert_eq!(
+            decoder_wait_timeout(frame_interval, now + frame_interval * 3, Some(now)),
+            frame_interval
+        );
+    }
+
+    #[test]
+    fn decoder_wait_preserves_the_fallback_without_runtime_time() {
+        let vsync_time = Duration::from_secs(100);
+
+        assert_eq!(
+            decoder_wait_timeout(Duration::from_millis(10), vsync_time, None),
+            Duration::from_millis(4)
+        );
+        assert_eq!(
+            decoder_wait_timeout(Duration::from_millis(4), vsync_time, None),
+            Duration::ZERO
+        );
     }
 }

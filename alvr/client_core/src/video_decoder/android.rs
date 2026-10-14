@@ -120,11 +120,14 @@ impl VideoDecoderSource {
             );
         }
 
-        // use running average to give more weight to recent samples
+        // Measure only the extra frames buffered behind the one about to be presented, so that a
+        // single on-time frame in the queue does not count as backlog and get dropped when
+        // `max_buffering_frames` is close to 1.0.
+        let buffered_frames = image_queue_lock.len().saturating_sub(1);
         self.buffering_running_average = self.buffering_running_average
             * self.config.buffering_history_weight
-            + image_queue_lock.len() as f32 * (1. - self.config.buffering_history_weight);
-        if self.buffering_running_average > self.config.max_buffering_frames as f32 {
+            + buffered_frames as f32 * (1. - self.config.buffering_history_weight);
+        if self.buffering_running_average > self.config.max_buffering_frames {
             image_queue_lock.pop_front();
         }
 
@@ -326,9 +329,12 @@ fn decoder_lifecycle(
 
     let mut error_counter = 0;
     while running.value() {
-        match decoder.dequeue_output_buffer(Duration::from_millis(1)) {
+        match decoder.dequeue_output_buffer(Duration::from_millis(5)) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(buffer)) => {
-                // The buffer timestamp is actually nanoseconds
+                // queue_input_buffer stores nanoseconds in MediaCodec's microsecond timestamp field.
+                // Pass that value explicitly so ImageReader preserves the exact frame timestamp.
+                // release_output_buffer(buffer, true) would multiply it by 1000, preventing the
+                // compositor from matching the frame to its eye poses, FoVs and foveation centers.
                 let presentation_time_ns = buffer.info().presentation_time_us();
 
                 if let Err(e) = decoder.release_output_buffer_at_time(buffer, presentation_time_ns)

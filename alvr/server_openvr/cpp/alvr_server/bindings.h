@@ -220,7 +220,7 @@ extern "C" void ReportEncoderFoveationCenters(
 extern "C" unsigned long long GetSerialNumber(unsigned long long deviceID, char* outString);
 extern "C" void SetOpenvrProps(void* instancePtr, unsigned long long deviceID);
 extern "C" void RegisterButtons(void* instancePtr, unsigned long long deviceID);
-extern "C" void WaitForVSync();
+extern "C" void WaitForVSync(unsigned int throttleFrames);
 
 // The vsync grid, in Rust. The driver starts and stops the announcer with its own lifetime, holds
 // Present against the grid, and reads the skipped tick count, without keeping a copy of any of it.

@@ -699,7 +699,7 @@ extern "C" fn report_present(timestamp_ns: u64, offset_ns: u64) {
 }
 
 #[unsafe(export_name = "WaitForVSync")]
-extern "C" fn wait_for_vsync() {
+extern "C" fn wait_for_vsync(throttle_frames: u32) {
     // Default 120Hz-ish wait if StatisticsManager isn't up.
     // We use 120Hz-ish so that SteamVR doesn't accidentally get
     // any weird ideas about our display Hz with its frame pacing.
@@ -720,7 +720,7 @@ extern "C" fn wait_for_vsync() {
         let sleep_duration = SERVER_CORE_CONTEXT
             .read()
             .as_ref()
-            .and_then(|ctx| ctx.claim_next_vsync_slot());
+            .and_then(|ctx| ctx.claim_next_vsync_slot(throttle_frames));
 
         if let Some(duration) = sleep_duration {
             // A frame that missed its slot is submitted immediately, so a zero wait must not turn

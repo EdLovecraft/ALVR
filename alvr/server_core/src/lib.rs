@@ -531,14 +531,14 @@ impl ServerCoreContext {
             );
     }
 
-    pub fn claim_next_vsync_slot(&self) -> Option<Duration> {
+    pub fn claim_next_vsync_slot(&self, throttle_frames: u32) -> Option<Duration> {
         dbg_server_core!("claim_next_vsync_slot");
 
         self.connection_context
             .statistics_manager
             .write()
             .as_mut()
-            .map(|stats| stats.claim_next_vsync_slot())
+            .map(|stats| stats.claim_next_vsync_slot(throttle_frames))
     }
 }
 

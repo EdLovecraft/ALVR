@@ -583,7 +583,7 @@ pub extern "C" fn alvr_report_present(timestamp_ns: u64, offset_ns: u64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alvr_duration_until_next_vsync(out_ns: *mut u64) -> bool {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read()
-        && let Some(duration) = context.claim_next_vsync_slot()
+        && let Some(duration) = context.claim_next_vsync_slot(0)
     {
         unsafe { *out_ns = duration.as_nanos() as u64 };
 

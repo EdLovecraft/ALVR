@@ -272,10 +272,13 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
     m_presentMutex.unlock();
 }
 
-void OvrDirectModeComponent::PostPresent(const vr::IVRDriverDirectModeComponent::Throttling_t*) {
+void OvrDirectModeComponent::PostPresent(
+    const vr::IVRDriverDirectModeComponent::Throttling_t* pThrottling
+) {
     Debug("OvrDirectModeComponent::PostPresent");
 
-    WaitForVSync();
+    uint32_t throttleFrames = pThrottling != nullptr ? pThrottling->nFramesToThrottle : 0;
+    WaitForVSync(throttleFrames);
 }
 
 void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
