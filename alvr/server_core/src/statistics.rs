@@ -297,27 +297,30 @@ impl StatisticsManager {
     }
 
     // NB: this call is non-blocking, waiting should be done externally
-    pub fn claim_next_vsync_slot(&mut self) -> Duration {
+    pub fn claim_next_vsync_slot(&mut self, throttle_frames: u32) -> Duration {
         claim_next_vsync_slot(
             &mut self.last_vsync_time,
             self.frame_interval,
+            throttle_frames,
             Instant::now(),
         )
     }
 }
 
 // Claims the next vsync slot and returns how long the caller must wait for it. This is not a pure
-// query: every call advances the pacing phase by one frame interval, so it must be called exactly
-// once per produced frame, and only while server frame pacing is enabled. A frame that arrives
-// after its slot has passed is let through immediately and re-anchors the phase, which keeps
-// framerates below the refresh rate from being quantized to an integer divisor of it (a slightly
-// late 90 Hz frame would otherwise be delayed to the 45 Hz slot).
+// query: every call advances the pacing phase by one frame interval (plus any extra frames SteamVR
+// asked to throttle by), so it must be called exactly once per produced frame, and only while
+// server frame pacing is enabled. A frame that arrives after its slot has passed is let through
+// immediately and re-anchors the phase, which keeps framerates below the refresh rate from being
+// quantized to an integer divisor of it (a slightly late 90 Hz frame would otherwise be delayed to
+// the 45 Hz slot).
 fn claim_next_vsync_slot(
     last_vsync_time: &mut Instant,
     frame_interval: Duration,
+    throttle_frames: u32,
     now: Instant,
 ) -> Duration {
-    let next_vsync_time = *last_vsync_time + frame_interval;
+    let next_vsync_time = *last_vsync_time + frame_interval * (1 + throttle_frames);
 
     if next_vsync_time <= now {
         *last_vsync_time = now;
@@ -343,6 +346,7 @@ mod tests {
         let wait = claim_next_vsync_slot(
             &mut last_vsync_time,
             frame_interval,
+            0,
             start + Duration::from_millis(4),
         );
 
@@ -357,7 +361,7 @@ mod tests {
         let late_frame_time = start + Duration::from_millis(12);
         let mut last_vsync_time = start;
 
-        let wait = claim_next_vsync_slot(&mut last_vsync_time, frame_interval, late_frame_time);
+        let wait = claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, late_frame_time);
 
         assert_eq!(wait, Duration::ZERO);
         assert_eq!(last_vsync_time, late_frame_time);
@@ -372,11 +376,11 @@ mod tests {
         let mut last_vsync_time = start;
 
         assert_eq!(
-            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, late_frame_time,),
+            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, late_frame_time,),
             Duration::ZERO
         );
         assert_eq!(
-            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, next_frame_time,),
+            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, next_frame_time,),
             Duration::from_millis(6)
         );
     }
@@ -391,7 +395,7 @@ mod tests {
             let frame_time = start + Duration::from_millis(9 * frame_index);
 
             assert_eq!(
-                claim_next_vsync_slot(&mut last_vsync_time, frame_interval, frame_time,),
+                claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, frame_time,),
                 Duration::ZERO
             );
             assert_eq!(last_vsync_time, frame_time);
@@ -409,7 +413,7 @@ mod tests {
             let frame_time = expected_deadline - Duration::from_millis(4);
 
             assert_eq!(
-                claim_next_vsync_slot(&mut last_vsync_time, frame_interval, frame_time,),
+                claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, frame_time,),
                 Duration::from_millis(4)
             );
             assert_eq!(last_vsync_time, expected_deadline);
@@ -425,13 +429,14 @@ mod tests {
         // Calling twice inside the same interval claims two slots: the second call waits for the
         // slot after the one the first call already took. Callers must not treat this as a query.
         assert_eq!(
-            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, start),
+            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, start),
             frame_interval
         );
         assert_eq!(
             claim_next_vsync_slot(
                 &mut last_vsync_time,
                 frame_interval,
+                0,
                 start + Duration::from_millis(1)
             ),
             frame_interval * 2 - Duration::from_millis(1)
@@ -445,7 +450,12 @@ mod tests {
         let mut last_vsync_time = start;
 
         assert_eq!(
-            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, start + frame_interval),
+            claim_next_vsync_slot(
+                &mut last_vsync_time,
+                frame_interval,
+                0,
+                start + frame_interval
+            ),
             Duration::ZERO
         );
         assert_eq!(last_vsync_time, start + frame_interval);
@@ -463,10 +473,28 @@ mod tests {
                 claim_next_vsync_slot(
                     &mut last_vsync_time,
                     Duration::ZERO,
+                    0,
                     start + Duration::from_millis(frame_index.into())
                 ),
                 Duration::ZERO
             );
         }
+    }
+
+    #[test]
+    fn frame_pacing_honors_throttle_frames() {
+        let frame_interval = Duration::from_millis(10);
+        let start = Instant::now();
+        let mut last_vsync_time = start;
+
+        let wait = claim_next_vsync_slot(
+            &mut last_vsync_time,
+            frame_interval,
+            1,
+            start + Duration::from_millis(4),
+        );
+
+        assert_eq!(wait, Duration::from_millis(16));
+        assert_eq!(last_vsync_time, start + frame_interval * 2);
     }
 }

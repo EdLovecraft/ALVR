@@ -217,7 +217,7 @@ extern "C" void ReportEncoderFoveationCenters(
 extern "C" unsigned long long GetSerialNumber(unsigned long long deviceID, char* outString);
 extern "C" void SetOpenvrProps(void* instancePtr, unsigned long long deviceID);
 extern "C" void RegisterButtons(void* instancePtr, unsigned long long deviceID);
-extern "C" void WaitForVSync();
+extern "C" void WaitForVSync(unsigned int throttleFrames);
 
 extern "C" void CppInit(bool earlyHmdInitialization, Settings settings);
 extern "C" void* CppOpenvrEntryPoint(const char* pInterfaceName, int* pReturnCode);
