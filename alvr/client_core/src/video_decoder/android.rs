@@ -1,4 +1,4 @@
-use super::VideoDecoderConfig;
+use super::{VideoDecoderConfig, frame_queue::FrameQueue};
 use alvr_common::{
     RelaxedAtomic, ToAny,
     anyhow::{Context, Result, anyhow, bail},
@@ -18,7 +18,6 @@ use ndk::{
     },
 };
 use std::{
-    collections::VecDeque,
     ffi::c_void,
     ops::Deref,
     ptr,
@@ -78,21 +77,25 @@ impl VideoDecoderSink {
     }
 }
 
+const MAX_ACQUIRED_IMAGES: usize = 10;
+
 struct QueuedImage {
     timestamp: Duration,
     image: Image,
-    in_use: bool,
 }
 unsafe impl Send for QueuedImage {}
+
+type SharedImageQueue = Arc<Mutex<FrameQueue<QueuedImage>>>;
 
 // Access the image queue synchronously.
 pub struct VideoDecoderSource {
     running: Arc<RelaxedAtomic>,
-    dequeue_thread: Option<JoinHandle<()>>,
-    image_queue: Arc<Mutex<VecDeque<QueuedImage>>>,
+    // Keep the ImageReader in the thread result even after a decoder error: it must outlive every
+    // acquired Image, including the one currently held by the consumer.
+    dequeue_thread: Option<JoinHandle<Option<FakeThreadSafe<ImageReader>>>>,
+    image_queue: SharedImageQueue,
     frame_available: Arc<Condvar>,
-    config: VideoDecoderConfig,
-    buffering_running_average: f32,
+    current_image: Option<QueuedImage>,
 }
 
 unsafe impl Send for VideoDecoderSource {}
@@ -101,40 +104,30 @@ impl VideoDecoderSource {
     // If no frame is ready, wait up to `timeout` for the decoder to produce one. The application
     // MUST finish using the returned buffer before calling this function again.
     pub fn dequeue_frame_timeout(&mut self, timeout: Duration) -> Option<(Duration, *mut c_void)> {
-        let mut image_queue_lock = self.image_queue.lock();
+        // The previous buffer can now be reused by the decoder. Release it without the queue lock.
+        drop(self.current_image.take());
 
-        if let Some(queued_image) = image_queue_lock.front()
-            && queued_image.in_use
-        {
-            // image is released and ready to be reused by the decoder
-            image_queue_lock.pop_front();
-        }
+        let (next_image, discarded) = {
+            let mut image_queue_lock = self.image_queue.lock();
 
-        if image_queue_lock.is_empty() {
-            // The caller has to submit a layer at every vsync even when the decoder is late, so
-            // the wait is bounded and a timeout is not an error.
-            self.frame_available.wait_while_for(
-                &mut image_queue_lock,
-                |image_queue| image_queue.is_empty(),
-                timeout,
-            );
-        }
+            if image_queue_lock.is_empty() {
+                // Submit a layer at every vsync even when the decoder is late. A timeout is normal.
+                self.frame_available.wait_while_for(
+                    &mut image_queue_lock,
+                    |image_queue| image_queue.is_empty(),
+                    timeout,
+                );
+            }
 
-        // Measure only the extra frames buffered behind the one about to be presented, so that a
-        // single on-time frame in the queue does not count as backlog and get dropped when
-        // `max_buffering_frames` is close to 1.0.
-        let buffered_frames = image_queue_lock.len().saturating_sub(1);
-        self.buffering_running_average = self.buffering_running_average
-            * self.config.buffering_history_weight
-            + buffered_frames as f32 * (1. - self.config.buffering_history_weight);
-        if self.buffering_running_average > self.config.max_buffering_frames {
-            image_queue_lock.pop_front();
-        }
+            image_queue_lock.dequeue()
+        };
+        drop(discarded);
 
-        if let Some(queued_image) = image_queue_lock.front_mut() {
-            queued_image.in_use = true;
-
-            Some((
+        // Once dequeued, only this source can release the image. Producer-side overflow and error
+        // recovery operate exclusively on pending frames, never on a buffer being rendered.
+        self.current_image = next_image;
+        self.current_image.as_ref().map(|queued_image| {
+            (
                 queued_image.timestamp,
                 queued_image
                     .image
@@ -142,12 +135,8 @@ impl VideoDecoderSource {
                     .unwrap()
                     .as_ptr()
                     .cast(),
-            ))
-        } else {
-            // TODO: add back when implementing proper phase sync
-            //warn!("Video frame queue underflow!");
-            None
-        }
+            )
+        })
     }
 }
 
@@ -155,8 +144,17 @@ impl Drop for VideoDecoderSource {
     fn drop(&mut self) {
         self.running.set(false);
 
-        // Destruction of decoder, buffered images and ImageReader
-        self.dequeue_thread.take().map(|t| t.join());
+        let image_reader = self
+            .dequeue_thread
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .flatten();
+
+        // Images must be released before their parent ImageReader, and outside the queue lock.
+        drop(self.current_image.take());
+        let pending = self.image_queue.lock().clear();
+        drop(pending);
+        drop(image_reader);
     }
 }
 
@@ -203,8 +201,8 @@ fn decoder_setup(
     Ok(decoder)
 }
 
-// Since we leak the ImageReader, and we pass frame_result_callback to it which contains a reference
-// to ClientCoreContext, to avoid circular references we need to use a Weak reference.
+// The ImageReader can outlive this thread after an error. Its listener must not keep the client
+// context alive once the decoder's strong callback reference is gone.
 fn decoder_lifecycle(
     config: VideoDecoderConfig,
     csd_0: Vec<u8>,
@@ -212,56 +210,68 @@ fn decoder_lifecycle(
     running: Arc<RelaxedAtomic>,
     decoder_sink: Arc<Mutex<Option<SharedMediaCodec>>>,
     decoder_ready_notifier: Arc<Condvar>,
-    image_queue: Arc<Mutex<VecDeque<QueuedImage>>>,
+    image_queue: SharedImageQueue,
     frame_available: Arc<Condvar>,
     image_reader: &mut ImageReader,
 ) -> Result<()> {
-    // 2x: keep the target buffering in the middle of the max amount of queuable frames
-    let available_buffering_frames = (2. * config.max_buffering_frames).ceil() as usize;
-
     image_reader.set_image_listener(Box::new({
         let image_queue = Arc::clone(&image_queue);
         let frame_available = Arc::clone(&frame_available);
+        let running = Arc::clone(&running);
         move |image_reader| {
-            let mut image_queue_lock = image_queue.lock();
-
-            if image_queue_lock.len() > available_buffering_frames {
-                warn!("Video frame queue overflow!");
-                image_queue_lock.pop_front();
+            if !running.value() {
+                return;
             }
 
+            let overflow = image_queue.lock().discard_oldest_if_full();
+            if overflow.is_some() {
+                warn!("Video frame queue overflow!");
+            }
+            drop(overflow);
+
+            // Acquiring an image may wait for a fence. Neither it nor the statistics callback may
+            // hold the queue lock and delay the compositor's bounded dequeue.
             match image_reader.acquire_next_image() {
                 Ok(AcquireResult::Image(image)) => {
                     let timestamp = Duration::from_nanos(image.timestamp().unwrap() as u64);
 
+                    // Record decode completion before making the image visible to the consumer.
                     if let Some(callback) = frame_result_callback.upgrade() {
                         callback(Ok(timestamp));
                     }
 
-                    image_queue_lock.push_back(QueuedImage {
-                        timestamp,
-                        image,
-                        in_use: false,
-                    });
-
+                    let queued_image = QueuedImage { timestamp, image };
+                    let discarded = {
+                        let mut queue = image_queue.lock();
+                        // Check under the lock so teardown cannot clear the queue only for a late
+                        // callback to repopulate it before the ImageReader is destroyed.
+                        if running.value() {
+                            queue.push(queued_image)
+                        } else {
+                            Some(queued_image)
+                        }
+                    };
+                    drop(discarded);
                     frame_available.notify_one();
                 }
+                Ok(AcquireResult::NoBufferAvailable) => (),
                 Ok(e) => {
                     error!("ImageReader error: {e:?}");
 
-                    image_queue_lock.pop_front();
+                    let pending = image_queue.lock().clear();
+                    drop(pending);
                 }
                 Err(e) => {
                     error!("ImageReader error: {e}");
 
-                    image_queue_lock.clear();
+                    let pending = image_queue.lock().clear();
+                    drop(pending);
                 }
             }
         }
     }))?;
 
-    // Documentation says that this call is necessary to properly dispose acquired buffers.
-    // todo: find out how to use it and avoid leaking the ImageReader
+    // Keep the buffer removal listener registered for the lifetime of the ImageReader.
     image_reader.set_buffer_removed_listener(Box::new(|_, _| ()))?;
 
     let mime = mime_for_codec(config.codec);
@@ -379,7 +389,12 @@ pub fn video_decoder_split(
     let running = Arc::new(RelaxedAtomic::new(true));
     let decoder_sink = Arc::new(Mutex::new(None::<SharedMediaCodec>));
     let decoder_ready_notifier = Arc::new(Condvar::new());
-    let image_queue = Arc::new(Mutex::new(VecDeque::<QueuedImage>::new()));
+    // Leave room for the consumer's current image and an image being acquired by the callback.
+    let image_queue = Arc::new(Mutex::new(FrameQueue::new(
+        config.max_buffering_frames,
+        config.buffering_history_weight,
+        MAX_ACQUIRED_IMAGES - 2,
+    )));
     let frame_available = Arc::new(Condvar::new());
 
     let dequeue_thread = thread::spawn({
@@ -390,18 +405,17 @@ pub fn video_decoder_split(
         let image_queue = Arc::clone(&image_queue);
         let frame_available = Arc::clone(&frame_available);
         move || {
-            const MAX_BUFFERING_FRAMES: usize = 10;
             let mut image_reader = match ImageReader::new_with_usage(
                 1,
                 1,
                 ImageFormat::PRIVATE,
                 HardwareBufferUsage::GPU_SAMPLED_IMAGE,
-                MAX_BUFFERING_FRAMES as i32,
+                MAX_ACQUIRED_IMAGES as i32,
             ) {
                 Ok(reader) => reader,
                 Err(e) => {
                     frame_result_callback(Err(anyhow!("{e}")));
-                    return;
+                    return None;
                 }
             };
 
@@ -411,7 +425,7 @@ pub fn video_decoder_split(
                 config,
                 csd_0,
                 Arc::downgrade(&frame_result_callback),
-                running,
+                Arc::clone(&running),
                 decoder_sink,
                 decoder_ready_notifier,
                 Arc::clone(&image_queue),
@@ -421,7 +435,11 @@ pub fn video_decoder_split(
                 frame_result_callback(Err(e));
             }
 
-            image_queue.lock().clear();
+            running.set(false);
+            let pending = image_queue.lock().clear();
+            drop(pending);
+
+            Some(FakeThreadSafe(image_reader))
         }
     });
 
@@ -444,8 +462,7 @@ pub fn video_decoder_split(
         dequeue_thread: Some(dequeue_thread),
         image_queue,
         frame_available,
-        config,
-        buffering_running_average: 0.0,
+        current_image: None,
     };
 
     Ok((sink, source))

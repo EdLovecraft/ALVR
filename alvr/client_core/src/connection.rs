@@ -53,6 +53,9 @@ const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 const VIDEO_FRAME_METADATA_HISTORY_SIZE: usize = 128;
+// Keep at most one pending snapshot in addition to the packet currently being sent. Telemetry
+// must never backpressure rendering or build up a queue of obsolete samples.
+const STATISTICS_QUEUE_CAPACITY: usize = 1;
 
 pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
 
@@ -62,11 +65,31 @@ pub struct ConnectionContext {
     pub disconnected_notif: Condvar,
     pub control_sender: Mutex<Option<ControlSocketSender<ClientControlPacket>>>,
     pub tracking_sender: Mutex<Option<StreamSender<TrackingData>>>,
-    pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
+    pub statistics_sender: Mutex<Option<mpsc::SyncSender<ClientStatistics>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
     pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
     pub video_frame_metadata_queue: Mutex<VecDeque<(Duration, VideoFrameMetadata)>>,
     pub max_prediction: RwLock<Duration>,
+}
+
+impl ConnectionContext {
+    pub fn report_submit(&self, timestamp: Duration, vsync_queue: Duration) {
+        let summary = {
+            let mut stats_lock = self.statistics_manager.lock();
+            stats_lock.as_mut().and_then(|stats| {
+                stats.report_submit(timestamp, vsync_queue);
+                stats.summary(timestamp)
+            })
+        };
+
+        if let Some(summary) = summary
+            && let Some(sender) = &*self.statistics_sender.lock()
+        {
+            // No socket access or logging on the submission path. A full or disconnected channel
+            // only loses telemetry; local prediction statistics have already been updated.
+            sender.try_send(summary).ok();
+        }
+    }
 }
 
 fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str) {
@@ -84,6 +107,26 @@ fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str
 
 fn is_streaming(ctx: &ConnectionContext) -> bool {
     *ctx.state.read() == ConnectionState::Streaming
+}
+
+fn statistics_send_loop(
+    ctx: &ConnectionContext,
+    receiver: mpsc::Receiver<ClientStatistics>,
+    mut send: impl FnMut(&ClientStatistics) -> bool,
+) {
+    while is_streaming(ctx) {
+        let packet = match receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
+            Ok(packet) => packet,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        // Do not send a pending snapshot after disconnect. No context/queue locks are held while
+        // the actual network sender waits on the socket or its shared write lock.
+        if !is_streaming(ctx) || !send(&packet) {
+            break;
+        }
+    }
 }
 
 pub fn connection_lifecycle_loop(
@@ -270,7 +313,9 @@ fn connection_pipeline(
     let tracking_sender = stream_socket.request_stream(TRACKING);
     let mut haptics_receiver =
         stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
-    let statistics_sender = stream_socket.request_stream(STATISTICS);
+    let mut statistics_sender = stream_socket.request_stream(STATISTICS);
+    let (statistics_channel_sender, statistics_channel_receiver) =
+        mpsc::sync_channel(STATISTICS_QUEUE_CAPACITY);
 
     ctx.video_frame_metadata_queue.lock().clear();
 
@@ -418,6 +463,15 @@ fn connection_pipeline(
         }
     });
 
+    let statistics_send_thread = thread::spawn({
+        let ctx = Arc::clone(&ctx);
+        move || {
+            statistics_send_loop(&ctx, statistics_channel_receiver, |packet| {
+                statistics_sender.send_header(packet).is_ok()
+            });
+        }
+    });
+
     let (log_channel_sender, log_channel_receiver) = mpsc::channel();
 
     let control_send_thread = thread::spawn({
@@ -547,7 +601,7 @@ fn connection_pipeline(
 
     *ctx.control_sender.lock() = Some(control_sender);
     *ctx.tracking_sender.lock() = Some(tracking_sender);
-    *ctx.statistics_sender.lock() = Some(statistics_sender);
+    *ctx.statistics_sender.lock() = Some(statistics_channel_sender);
     if let Switch::Enabled(filter_level) = settings.extra.logging.client_log_report_level {
         *LOG_CHANNEL_SENDER.lock() = Some(LogMirrorData {
             sender: log_channel_sender,
@@ -584,6 +638,7 @@ fn connection_pipeline(
     game_audio_thread.join().ok();
     microphone_thread.join().ok();
     haptics_receive_thread.join().ok();
+    statistics_send_thread.join().ok();
     control_send_thread.join().ok();
     control_receive_thread.join().ok();
     stream_receive_thread.join().ok();
@@ -591,4 +646,149 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: End");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn statistics_context() -> Arc<ConnectionContext> {
+        let ctx = Arc::new(ConnectionContext::default());
+        *ctx.state.write() = ConnectionState::Streaming;
+        let mut stats = StatisticsManager::new(8);
+        for timestamp in 1..=3 {
+            stats.report_input_acquired(Duration::from_secs(timestamp));
+        }
+        *ctx.statistics_manager.lock() = Some(stats);
+        ctx
+    }
+
+    #[test]
+    fn submit_enqueues_a_statistics_snapshot() {
+        let ctx = statistics_context();
+        let (sender, receiver) = mpsc::sync_channel(STATISTICS_QUEUE_CAPACITY);
+        *ctx.statistics_sender.lock() = Some(sender);
+        let timestamp = Duration::from_secs(1);
+        let vsync_queue = Duration::from_millis(2);
+
+        ctx.report_submit(timestamp, vsync_queue);
+
+        let packet = receiver.try_recv().unwrap();
+        assert_eq!(packet.target_timestamp, timestamp);
+        assert_eq!(packet.vsync_queue, vsync_queue);
+        assert!(packet.total_pipeline_latency >= vsync_queue);
+        let stats_lock = ctx.statistics_manager.lock();
+        let stats = stats_lock.as_ref().unwrap();
+        assert_eq!(
+            stats.summary(timestamp).unwrap().total_pipeline_latency,
+            packet.total_pipeline_latency
+        );
+        // The prediction average is seeded with a zero sample, so it need not equal this snapshot.
+        assert!(stats.average_total_pipeline_latency() > Duration::ZERO);
+    }
+
+    #[test]
+    fn submit_without_matching_history_does_not_enqueue_statistics() {
+        let ctx = statistics_context();
+        let (sender, receiver) = mpsc::sync_channel(STATISTICS_QUEUE_CAPACITY);
+        *ctx.statistics_sender.lock() = Some(sender);
+
+        ctx.report_submit(Duration::from_secs(4), Duration::ZERO);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn closed_statistics_queue_does_not_prevent_local_updates() {
+        let ctx = statistics_context();
+        let (sender, receiver) = mpsc::sync_channel(STATISTICS_QUEUE_CAPACITY);
+        *ctx.statistics_sender.lock() = Some(sender);
+        drop(receiver);
+        let timestamp = Duration::from_secs(1);
+        let vsync_queue = Duration::from_millis(3);
+
+        ctx.report_submit(timestamp, vsync_queue);
+
+        let stats_lock = ctx.statistics_manager.lock();
+        let packet = stats_lock.as_ref().unwrap().summary(timestamp).unwrap();
+        assert_eq!(packet.vsync_queue, vsync_queue);
+    }
+
+    #[test]
+    fn blocked_network_sender_does_not_block_submission_or_send_after_disconnect() {
+        let ctx = statistics_context();
+        let (sender, receiver) = mpsc::sync_channel(STATISTICS_QUEUE_CAPACITY);
+        *ctx.statistics_sender.lock() = Some(sender);
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
+
+        let worker = thread::spawn({
+            let ctx = Arc::clone(&ctx);
+            move || {
+                statistics_send_loop(&ctx, receiver, |packet| {
+                    started_sender.send(packet.target_timestamp).unwrap();
+                    // Model a socket send stalled on network I/O or the shared socket lock.
+                    resume_receiver.recv().is_ok()
+                });
+            }
+        });
+
+        ctx.report_submit(Duration::from_secs(1), Duration::ZERO);
+        let started = started_receiver.recv_timeout(Duration::from_secs(2));
+        if started.is_err() {
+            *ctx.state.write() = ConnectionState::Disconnecting;
+            ctx.statistics_sender.lock().take();
+            resume_sender.send(()).ok();
+            worker.join().unwrap();
+            panic!("Statistics worker did not start");
+        }
+        assert_eq!(started.unwrap(), Duration::from_secs(1));
+
+        let (done_sender, done_receiver) = mpsc::channel();
+        let producer = thread::spawn({
+            let ctx = Arc::clone(&ctx);
+            move || {
+                // One pending snapshot fills the queue. The next one must be dropped, not waited on.
+                ctx.report_submit(Duration::from_secs(2), Duration::ZERO);
+                ctx.report_submit(Duration::from_secs(3), Duration::from_millis(4));
+                done_sender.send(()).ok();
+            }
+        });
+        let submitted_without_waiting = done_receiver.recv_timeout(Duration::from_secs(2)).is_ok();
+        let local_statistics_updated = ctx.statistics_manager.try_lock().is_some_and(|stats| {
+            stats
+                .as_ref()
+                .unwrap()
+                .summary(Duration::from_secs(3))
+                .unwrap()
+                .vsync_queue
+                == Duration::from_millis(4)
+        });
+
+        // Always unblock/join both threads before asserting, even if a blocking send regresses.
+        *ctx.state.write() = ConnectionState::Disconnecting;
+        resume_sender.send(()).ok();
+        producer.join().unwrap();
+        ctx.statistics_sender.lock().take();
+        worker.join().unwrap();
+
+        assert!(submitted_without_waiting);
+        assert!(local_statistics_updated);
+        assert!(matches!(
+            started_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn statistics_worker_exits_when_its_queue_is_disconnected() {
+        let ctx = statistics_context();
+        let (sender, receiver) = mpsc::sync_channel(STATISTICS_QUEUE_CAPACITY);
+        drop(sender);
+
+        statistics_send_loop(&ctx, receiver, |_| panic!("No snapshot was queued"));
+    }
 }

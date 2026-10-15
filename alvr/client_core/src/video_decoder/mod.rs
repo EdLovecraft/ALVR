@@ -1,5 +1,7 @@
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(any(target_os = "android", test))]
+mod frame_queue;
 
 use alvr_common::anyhow::Result;
 use alvr_session::{CodecType, MediacodecProperty};
@@ -40,6 +42,8 @@ pub struct VideoDecoderSource {
 
 impl VideoDecoderSource {
     /// If a frame is available, return the timestamp and the AHardwareBuffer.
+    /// The buffer remains valid until the next frame dequeue or this source is dropped. Finish
+    /// using it (including GPU reads) before either happens.
     pub fn get_frame(&mut self) -> Option<(Duration, *mut std::ffi::c_void)> {
         self.get_frame_timeout(Duration::ZERO)
     }
