@@ -1,5 +1,5 @@
 use alvr_common::{HEAD_ID, SlidingWindowAverage};
-use alvr_events::{BitrateDirectives, EventType, GraphStatistics, StatisticsSummary};
+use alvr_events::{BitrateDirectives, GraphStatistics, StatisticsSummary};
 use alvr_packets::ClientStatistics;
 use std::{
     collections::{HashMap, VecDeque},
@@ -40,6 +40,15 @@ struct BatteryData {
     is_plugged: bool,
 }
 
+// Owned snapshots let callers publish telemetry after releasing the statistics lock.
+#[derive(Default)]
+pub struct StatisticsReport {
+    pub network_latency: Duration,
+    pub game_latency: Duration,
+    pub summary: Option<StatisticsSummary>,
+    pub graph: Option<GraphStatistics>,
+}
+
 pub struct StatisticsManager {
     history_buffer: VecDeque<HistoryFrame>,
     max_history_size: usize,
@@ -53,8 +62,6 @@ pub struct StatisticsManager {
     battery_gauges: HashMap<u64, BatteryData>,
     steamvr_pipeline_latency: Duration,
     motion_to_photon_latency_average: SlidingWindowAverage<Duration>,
-    last_vsync_time: Instant,
-    frame_interval: Duration,
     last_throughput_directives: BitrateDirectives,
 }
 
@@ -83,8 +90,6 @@ impl StatisticsManager {
                 Duration::ZERO,
                 max_history_size,
             ),
-            last_vsync_time: Instant::now(),
-            frame_interval: nominal_server_frame_interval,
             last_throughput_directives: BitrateDirectives::default(),
         }
     }
@@ -172,9 +177,16 @@ impl StatisticsManager {
         self.last_throughput_directives = stats;
     }
 
-    // Called every frame. Some statistics are reported once every frame
-    // Returns (network latency, game time latency)
-    pub fn report_statistics(&mut self, client_stats: ClientStatistics) -> (Duration, Duration) {
+    // Called every frame. Publishing the returned snapshots must happen outside the lock.
+    pub fn report_statistics(&mut self, client_stats: ClientStatistics) -> StatisticsReport {
+        self.report_statistics_at(client_stats, Instant::now())
+    }
+
+    fn report_statistics_at(
+        &mut self,
+        client_stats: ClientStatistics,
+        now: Instant,
+    ) -> StatisticsReport {
         self.motion_to_photon_latency_average
             .submit_sample(client_stats.total_pipeline_latency);
 
@@ -218,12 +230,12 @@ impl StatisticsManager {
             let server_fps =
                 1.0 / Duration::max(self.last_frame_present_interval, EPS_INTERVAL).as_secs_f32();
 
-            if self.last_full_report_instant + FULL_REPORT_INTERVAL < Instant::now() {
+            let summary = if self.last_full_report_instant + FULL_REPORT_INTERVAL < now {
                 self.last_full_report_instant += FULL_REPORT_INTERVAL;
 
                 let interval_secs = FULL_REPORT_INTERVAL.as_secs_f32();
 
-                alvr_events::send_event(EventType::StatisticsSummary(StatisticsSummary {
+                let summary = StatisticsSummary {
                     video_packets_total: self.video_packets_total,
                     video_packets_per_sec: (self.video_packets_partial_sum as f32 / interval_secs)
                         as _,
@@ -250,11 +262,15 @@ impl StatisticsManager {
                         .cloned()
                         .unwrap_or_default()
                         .is_plugged,
-                }));
+                };
 
                 self.video_packets_partial_sum = 0;
                 self.video_bytes_partial_sum = 0;
-            }
+
+                Some(summary)
+            } else {
+                None
+            };
 
             let packet_bits = frame.video_packet_bytes as f32 * 8.0;
             let throughput_bps =
@@ -264,7 +280,7 @@ impl StatisticsManager {
 
             // todo: use target timestamp in nanoseconds. the dashboard needs to use the first
             // timestamp as the graph time origin.
-            alvr_events::send_event(EventType::GraphStatistics(GraphStatistics {
+            let graph = GraphStatistics {
                 total_pipeline_latency_s: client_stats.total_pipeline_latency.as_secs_f32(),
                 game_time_s: game_time_latency.as_secs_f32(),
                 server_compositor_s: server_compositor_latency.as_secs_f32(),
@@ -279,11 +295,16 @@ impl StatisticsManager {
                 bitrate_directives: self.last_throughput_directives.clone(),
                 throughput_bps,
                 bitrate_bps,
-            }));
+            };
 
-            (network_latency, game_time_latency)
+            StatisticsReport {
+                network_latency,
+                game_latency: game_time_latency,
+                summary,
+                graph: Some(graph),
+            }
         } else {
-            (Duration::ZERO, Duration::ZERO)
+            StatisticsReport::default()
         }
     }
 
@@ -295,206 +316,158 @@ impl StatisticsManager {
         // This is the opposite of the client's StatisticsManager::tracker_prediction_offset().
         self.steamvr_pipeline_latency
     }
-
-    // NB: this call is non-blocking, waiting should be done externally
-    pub fn claim_next_vsync_slot(&mut self, throttle_frames: u32) -> Duration {
-        claim_next_vsync_slot(
-            &mut self.last_vsync_time,
-            self.frame_interval,
-            throttle_frames,
-            Instant::now(),
-        )
-    }
-}
-
-// Claims the next vsync slot and returns how long the caller must wait for it. This is not a pure
-// query: every call advances the pacing phase by one frame interval (plus any extra frames SteamVR
-// asked to throttle by), so it must be called exactly once per produced frame, and only while
-// server frame pacing is enabled. A frame that arrives after its slot has passed is let through
-// immediately and re-anchors the phase, which keeps framerates below the refresh rate from being
-// quantized to an integer divisor of it (a slightly late 90 Hz frame would otherwise be delayed to
-// the 45 Hz slot).
-fn claim_next_vsync_slot(
-    last_vsync_time: &mut Instant,
-    frame_interval: Duration,
-    throttle_frames: u32,
-    now: Instant,
-) -> Duration {
-    let next_vsync_time = *last_vsync_time + frame_interval * (1 + throttle_frames);
-
-    if next_vsync_time <= now {
-        *last_vsync_time = now;
-
-        Duration::ZERO
-    } else {
-        *last_vsync_time = next_vsync_time;
-
-        next_vsync_time - now
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn frame_pacing_waits_for_an_on_time_frame() {
-        let frame_interval = Duration::from_millis(10);
+    fn sample_frame() -> (StatisticsManager, ClientStatistics, Instant) {
         let start = Instant::now();
-        let mut last_vsync_time = start;
+        let timestamp = Duration::from_secs(1);
+        let mut stats = StatisticsManager::new(16, Duration::from_millis(10), 1.0);
+        stats.last_full_report_instant = start;
+        stats.last_frame_present_interval = Duration::from_millis(20);
+        stats.history_buffer.push_front(HistoryFrame {
+            target_timestamp: timestamp,
+            tracking_received: start,
+            frame_present: start + Duration::from_millis(4),
+            frame_composed: start + Duration::from_millis(6),
+            frame_encoded: start + Duration::from_millis(9),
+            video_packet_bytes: 62_500,
+            total_pipeline_latency: Duration::ZERO,
+        });
+        stats.report_throughput_stats(BitrateDirectives {
+            requested_bitrate_bps: 30_000_000.0,
+            ..Default::default()
+        });
+        stats.report_battery(*HEAD_ID, 0.75, true);
 
-        let wait = claim_next_vsync_slot(
-            &mut last_vsync_time,
-            frame_interval,
-            0,
-            start + Duration::from_millis(4),
+        let client = ClientStatistics {
+            target_timestamp: timestamp,
+            frame_interval: Duration::from_millis(10),
+            video_decode: Duration::from_millis(5),
+            video_decoder_queue: Duration::from_millis(2),
+            rendering: Duration::from_millis(1),
+            vsync_queue: Duration::from_millis(3),
+            total_pipeline_latency: Duration::from_millis(30),
+        };
+
+        (stats, client, start)
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= expected.abs().max(1.0) * 1e-6,
+            "expected {expected}, got {actual}"
         );
-
-        assert_eq!(wait, Duration::from_millis(6));
-        assert_eq!(last_vsync_time, start + frame_interval);
     }
 
     #[test]
-    fn frame_pacing_does_not_wait_after_missing_a_deadline() {
-        let frame_interval = Duration::from_millis(10);
-        let start = Instant::now();
-        let late_frame_time = start + Duration::from_millis(12);
-        let mut last_vsync_time = start;
+    fn matching_frame_returns_owned_latency_and_graph_snapshots() {
+        let (mut stats, client, start) = sample_frame();
+        let report = stats.report_statistics_at(client, start);
 
-        let wait = claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, late_frame_time);
-
-        assert_eq!(wait, Duration::ZERO);
-        assert_eq!(last_vsync_time, late_frame_time);
-    }
-
-    #[test]
-    fn frame_pacing_relocks_after_a_late_frame() {
-        let frame_interval = Duration::from_millis(10);
-        let start = Instant::now();
-        let late_frame_time = start + Duration::from_millis(12);
-        let next_frame_time = late_frame_time + Duration::from_millis(4);
-        let mut last_vsync_time = start;
-
+        assert_eq!(report.network_latency, Duration::from_millis(10));
+        assert_eq!(report.game_latency, Duration::from_millis(4));
+        assert!(report.summary.is_none());
         assert_eq!(
-            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, late_frame_time,),
-            Duration::ZERO
+            stats.history_buffer[0].total_pipeline_latency,
+            Duration::from_millis(30)
         );
+
+        // Later updates must not change an event awaiting publication outside the lock.
+        stats.report_throughput_stats(BitrateDirectives::default());
+        let graph = report.graph.unwrap();
+        assert_close(graph.total_pipeline_latency_s, 0.030);
+        assert_close(graph.game_time_s, 0.004);
+        assert_close(graph.server_compositor_s, 0.002);
+        assert_close(graph.encoder_s, 0.003);
+        assert_close(graph.network_s, 0.010);
+        assert_close(graph.decoder_s, 0.005);
+        assert_close(graph.decoder_queue_s, 0.002);
+        assert_close(graph.client_compositor_s, 0.001);
+        assert_close(graph.vsync_queue_s, 0.003);
+        assert_close(graph.client_fps, 100.0);
+        assert_close(graph.server_fps, 50.0);
+        assert_close(graph.throughput_bps, 50_000_000.0);
+        assert_close(graph.bitrate_bps, 25_000_000.0);
+        assert_close(graph.bitrate_directives.requested_bitrate_bps, 30_000_000.0);
+    }
+
+    #[test]
+    fn missing_frame_updates_prediction_without_publishing_or_resetting_counters() {
+        let (mut stats, mut client, start) = sample_frame();
+        client.target_timestamp += Duration::from_secs(1);
+        stats.video_packets_partial_sum = 2;
+        stats.video_bytes_partial_sum = 125_000;
+
+        let report = stats.report_statistics_at(client, start + FULL_REPORT_INTERVAL * 2);
+
+        assert_eq!(report.network_latency, Duration::ZERO);
+        assert_eq!(report.game_latency, Duration::ZERO);
+        assert!(report.summary.is_none());
+        assert!(report.graph.is_none());
+        // The initial zero sample and the new 30 ms sample are both retained.
         assert_eq!(
-            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, next_frame_time,),
-            Duration::from_millis(6)
+            stats.motion_to_photon_latency_average(),
+            Duration::from_millis(15)
         );
+        assert_eq!(stats.video_packets_partial_sum, 2);
+        assert_eq!(stats.video_bytes_partial_sum, 125_000);
+        assert_eq!(stats.last_full_report_instant, start);
     }
 
     #[test]
-    fn frame_pacing_does_not_quantize_continuously_late_120_hz_frames() {
-        let frame_interval = Duration::from_secs_f32(1.0 / 120.0);
-        let start = Instant::now();
-        let mut last_vsync_time = start;
+    fn summary_snapshots_keep_the_reporting_period_and_reset_only_partial_counts() {
+        let (mut stats, client, start) = sample_frame();
+        stats.video_packets_total = 20;
+        stats.video_packets_partial_sum = 2;
+        stats.video_bytes_total = 1_250_000;
+        stats.video_bytes_partial_sum = 125_000;
 
-        for frame_index in 1..=5 {
-            let frame_time = start + Duration::from_millis(9 * frame_index);
-
-            assert_eq!(
-                claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, frame_time,),
-                Duration::ZERO
-            );
-            assert_eq!(last_vsync_time, frame_time);
-        }
-    }
-
-    #[test]
-    fn frame_pacing_keeps_a_stable_deadline_for_early_frames() {
-        let frame_interval = Duration::from_millis(10);
-        let start = Instant::now();
-        let mut last_vsync_time = start;
-
-        for frame_index in 0_u32..5 {
-            let expected_deadline = start + frame_interval * (frame_index + 1);
-            let frame_time = expected_deadline - Duration::from_millis(4);
-
-            assert_eq!(
-                claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, frame_time,),
-                Duration::from_millis(4)
-            );
-            assert_eq!(last_vsync_time, expected_deadline);
-        }
-    }
-
-    #[test]
-    fn frame_pacing_claims_a_slot_on_every_call() {
-        let frame_interval = Duration::from_millis(10);
-        let start = Instant::now();
-        let mut last_vsync_time = start;
-
-        // Calling twice inside the same interval claims two slots: the second call waits for the
-        // slot after the one the first call already took. Callers must not treat this as a query.
-        assert_eq!(
-            claim_next_vsync_slot(&mut last_vsync_time, frame_interval, 0, start),
-            frame_interval
+        let boundary = start + FULL_REPORT_INTERVAL;
+        assert!(
+            stats
+                .report_statistics_at(client.clone(), boundary)
+                .summary
+                .is_none()
         );
-        assert_eq!(
-            claim_next_vsync_slot(
-                &mut last_vsync_time,
-                frame_interval,
-                0,
-                start + Duration::from_millis(1)
-            ),
-            frame_interval * 2 - Duration::from_millis(1)
+        assert_eq!(stats.video_packets_partial_sum, 2);
+
+        let report = stats.report_statistics_at(client.clone(), boundary + EPS_INTERVAL);
+        let summary = report.summary.unwrap();
+        assert_eq!(summary.video_packets_total, 20);
+        assert_eq!(summary.video_packets_per_sec, 4);
+        assert_eq!(summary.video_mbytes_total, 1);
+        assert_close(summary.video_mbits_per_sec, 2.0);
+        assert_close(summary.total_latency_ms, 30.0);
+        assert_close(summary.network_latency_ms, 10.0);
+        assert_close(summary.encode_latency_ms, 3.0);
+        assert_close(summary.decode_latency_ms, 5.0);
+        assert_eq!(summary.client_fps, 100);
+        assert_eq!(summary.server_fps, 50);
+        assert_eq!(summary.battery_hmd, 75);
+        assert!(summary.hmd_plugged);
+        assert_eq!(stats.video_packets_total, 20);
+        assert_eq!(stats.video_bytes_total, 1_250_000);
+        assert_eq!(stats.video_packets_partial_sum, 0);
+        assert_eq!(stats.video_bytes_partial_sum, 0);
+        assert_eq!(stats.last_full_report_instant, boundary);
+
+        let next_boundary = boundary + FULL_REPORT_INTERVAL;
+        assert!(
+            stats
+                .report_statistics_at(client.clone(), next_boundary)
+                .summary
+                .is_none()
         );
-    }
-
-    #[test]
-    fn frame_pacing_lets_a_frame_through_when_the_deadline_is_now() {
-        let frame_interval = Duration::from_millis(10);
-        let start = Instant::now();
-        let mut last_vsync_time = start;
-
-        assert_eq!(
-            claim_next_vsync_slot(
-                &mut last_vsync_time,
-                frame_interval,
-                0,
-                start + frame_interval
-            ),
-            Duration::ZERO
-        );
-        assert_eq!(last_vsync_time, start + frame_interval);
-    }
-
-    #[test]
-    fn frame_pacing_never_waits_with_a_zero_interval() {
-        // The previous implementation caught up to `now` with a loop adding the frame interval,
-        // which spun forever on a zero interval.
-        let start = Instant::now();
-        let mut last_vsync_time = start;
-
-        for frame_index in 0_u32..3 {
-            assert_eq!(
-                claim_next_vsync_slot(
-                    &mut last_vsync_time,
-                    Duration::ZERO,
-                    0,
-                    start + Duration::from_millis(frame_index.into())
-                ),
-                Duration::ZERO
-            );
-        }
-    }
-
-    #[test]
-    fn frame_pacing_honors_throttle_frames() {
-        let frame_interval = Duration::from_millis(10);
-        let start = Instant::now();
-        let mut last_vsync_time = start;
-
-        let wait = claim_next_vsync_slot(
-            &mut last_vsync_time,
-            frame_interval,
-            1,
-            start + Duration::from_millis(4),
-        );
-
-        assert_eq!(wait, Duration::from_millis(16));
-        assert_eq!(last_vsync_time, start + frame_interval * 2);
+        let next_summary = stats
+            .report_statistics_at(client, next_boundary + EPS_INTERVAL)
+            .summary
+            .unwrap();
+        assert_eq!(next_summary.video_packets_total, 20);
+        assert_eq!(next_summary.video_packets_per_sec, 0);
+        assert_close(next_summary.video_mbits_per_sec, 0.0);
     }
 }
