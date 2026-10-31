@@ -2,6 +2,7 @@ use crate::{
     ConnectionContext, FILESYSTEM_LAYOUT, SESSION_MANAGER, ServerCoreEvent,
     ServerNegotiatedStreamingConfig,
     bitrate::BitrateManager,
+    frame_pacing::FramePacer,
     input_mapping::ButtonMappingManager,
     sockets::WelcomeSocket,
     statistics::StatisticsManager,
@@ -897,9 +898,11 @@ fn connection_pipeline(
 
     let disconnect_notif = Arc::new(Condvar::new());
 
+    let frame_interval = Duration::from_secs_f32(1.0 / fps);
+    *ctx.frame_pacer.lock() = Some(FramePacer::new(frame_interval));
     *ctx.statistics_manager.write() = Some(StatisticsManager::new(
         initial_settings.connection.statistics_history_size,
-        Duration::from_secs_f32(1.0 / fps),
+        frame_interval,
         if let Switch::Enabled(config) = &initial_settings.headset.controllers {
             config.steamvr_pipeline_frames
         } else {
@@ -1133,22 +1136,38 @@ fn connection_pipeline(
                     return;
                 };
 
-                if let Some(stats) = &mut *ctx.statistics_manager.write() {
-                    let timestamp = client_stats.target_timestamp;
-                    let decoder_latency = client_stats.video_decode;
-                    let (network_latency, game_latency) = stats.report_statistics(client_stats);
-
+                let timestamp = client_stats.target_timestamp;
+                let decoder_latency = client_stats.video_decode;
+                let report = {
+                    ctx.statistics_manager
+                        .write()
+                        .as_mut()
+                        .map(|stats| stats.report_statistics(client_stats))
+                };
+                if let Some(report) = report {
+                    // Never hold the statistics lock during feedback, bitrate updates or logging.
                     ctx.events_sender
-                        .send(ServerCoreEvent::GameRenderLatencyFeedback(game_latency))
+                        .send(ServerCoreEvent::GameRenderLatencyFeedback(
+                            report.game_latency,
+                        ))
                         .ok();
 
-                    let session_manager_lock = SESSION_MANAGER.read();
-                    ctx.bitrate_manager.lock().report_frame_latencies(
-                        &session_manager_lock.settings().video.bitrate.mode,
-                        timestamp,
-                        network_latency,
-                        decoder_latency,
-                    );
+                    {
+                        let session_manager_lock = SESSION_MANAGER.read();
+                        ctx.bitrate_manager.lock().report_frame_latencies(
+                            &session_manager_lock.settings().video.bitrate.mode,
+                            timestamp,
+                            report.network_latency,
+                            decoder_latency,
+                        );
+                    }
+
+                    if let Some(summary) = report.summary {
+                        alvr_events::send_event(EventType::StatisticsSummary(summary));
+                    }
+                    if let Some(graph) = report.graph {
+                        alvr_events::send_event(EventType::GraphStatistics(graph));
+                    }
                 }
             }
         }

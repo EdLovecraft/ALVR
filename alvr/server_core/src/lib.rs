@@ -1,6 +1,7 @@
 mod bitrate;
 mod c_api;
 mod connection;
+mod frame_pacing;
 mod hand_gestures;
 mod haptics;
 mod input_mapping;
@@ -33,6 +34,7 @@ use alvr_server_io::ServerSessionManager;
 use alvr_session::{CodecType, H264Profile, OpenvrProperty, Settings, SteamvrHmdInitConfig};
 use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
+use frame_pacing::FramePacer;
 use statistics::StatisticsManager;
 use std::{
     collections::HashSet,
@@ -107,6 +109,8 @@ pub enum ServerCoreEvent {
 pub struct ConnectionContext {
     events_sender: mpsc::Sender<ServerCoreEvent>,
     statistics_manager: RwLock<Option<StatisticsManager>>,
+    // Pacing must not wait for statistics processing or telemetry output.
+    frame_pacer: Mutex<Option<FramePacer>>,
     bitrate_manager: Mutex<BitrateManager>,
     tracking_manager: RwLock<TrackingManager>,
     decoder_config: Mutex<Option<DecoderInitializationConfig>>,
@@ -208,11 +212,12 @@ impl ServerCoreContext {
 
         let (events_sender, events_receiver) = mpsc::channel();
 
-        // Create a temporary StatisticsManager until a headset connects
+        // Create temporary statistics and pacing state until a headset connects.
         let initial_settings = SESSION_MANAGER.read().settings().clone();
+        let initial_frame_interval = Duration::from_secs_f32(1.0 / 90.0);
         let stats = StatisticsManager::new(
             initial_settings.connection.statistics_history_size,
-            Duration::from_secs_f32(1.0 / 90.0),
+            initial_frame_interval,
             if let Switch::Enabled(config) = &initial_settings.headset.controllers {
                 config.steamvr_pipeline_frames
             } else {
@@ -223,6 +228,7 @@ impl ServerCoreContext {
         let connection_context = Arc::new(ConnectionContext {
             events_sender,
             statistics_manager: RwLock::new(Some(stats)),
+            frame_pacer: Mutex::new(Some(FramePacer::new(initial_frame_interval))),
             bitrate_manager: Mutex::new(BitrateManager::new(256, 60.0)),
             tracking_manager: RwLock::new(TrackingManager::new(
                 initial_settings.connection.statistics_history_size,
@@ -465,6 +471,7 @@ impl ServerCoreContext {
             if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
                 let encoder_latency = stats.report_frame_encoded(timestamp, buffer_size);
 
+                // Publish the encoded size before a statistics report can consume this frame.
                 self.connection_context
                     .bitrate_manager
                     .lock()
@@ -524,10 +531,10 @@ impl ServerCoreContext {
         dbg_server_core!("claim_next_vsync_slot");
 
         self.connection_context
-            .statistics_manager
-            .write()
+            .frame_pacer
+            .lock()
             .as_mut()
-            .map(|stats| stats.claim_next_vsync_slot(throttle_frames))
+            .map(|pacer| pacer.claim_next_vsync_slot(throttle_frames))
     }
 }
 

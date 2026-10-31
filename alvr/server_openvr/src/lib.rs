@@ -668,7 +668,7 @@ extern "C" fn report_present(timestamp_ns: u64, offset_ns: u64) {
 
 #[unsafe(export_name = "WaitForVSync")]
 extern "C" fn wait_for_vsync(throttle_frames: u32) {
-    // Default 120Hz-ish wait if StatisticsManager isn't up.
+    // Default 120Hz-ish wait if the frame pacer isn't up.
     // We use 120Hz-ish so that SteamVR doesn't accidentally get
     // any weird ideas about our display Hz with its frame pacing.
     static PRE_HEADSET_STATS_WAIT_INTERVAL: Duration = Duration::from_millis(8);
@@ -697,7 +697,7 @@ extern "C" fn wait_for_vsync(throttle_frames: u32) {
                 thread::sleep(duration);
             }
         } else {
-            // StatsManager isn't up because the headset hasn't connected, safety fallback to
+            // The frame pacer isn't available yet, safety fallback to
             // prevent deadlocking.
             thread::sleep(PRE_HEADSET_STATS_WAIT_INTERVAL);
         }

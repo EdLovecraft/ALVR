@@ -40,6 +40,11 @@ impl<T> Deref for FakeThreadSafe<T> {
 
 type SharedMediaCodec = Arc<FakeThreadSafe<MediaCodec>>;
 
+// Allow brief input-buffer contention without dropping a reference frame and waiting for an IDR.
+// Keep the budget well below a refresh period: this runs on the video receive thread. MediaCodec
+// returns immediately when a buffer is ready; this is a timeout, not a delay on every frame.
+const INPUT_BUFFER_TIMEOUT: Duration = Duration::from_millis(1);
+
 pub struct VideoDecoderSink {
     inner: Arc<Mutex<Option<SharedMediaCodec>>>,
 }
@@ -47,14 +52,14 @@ pub struct VideoDecoderSink {
 unsafe impl Send for VideoDecoderSink {}
 
 impl VideoDecoderSink {
-    // Block until the buffer has been written or timeout is reached. Returns false if timeout.
+    // Wait briefly for an input buffer, then submit the frame. Returns false if the wait times out.
     pub fn push_frame_nal(&mut self, timestamp: Duration, data: &[u8]) -> Result<bool> {
         let Some(decoder) = &*self.inner.lock() else {
             // This might happen only during destruction
             return Ok(false);
         };
 
-        match decoder.dequeue_input_buffer(Duration::ZERO) {
+        match decoder.dequeue_input_buffer(INPUT_BUFFER_TIMEOUT) {
             Ok(DequeuedInputBufferResult::Buffer(mut buffer)) => {
                 unsafe {
                     ptr::copy_nonoverlapping(
