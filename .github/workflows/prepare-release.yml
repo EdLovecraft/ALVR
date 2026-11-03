@@ -103,7 +103,7 @@ jobs:
           path: ./build/alvr_*_linux.tar.gz
 
   build_flatpak_bundle:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [prepare_release]
     steps:
       - uses: actions/checkout@v6
