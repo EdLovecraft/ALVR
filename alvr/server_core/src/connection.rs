@@ -22,9 +22,9 @@ use alvr_common::{
 use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientConnectionsAction, ClientControlPacket,
-    ClientNegotiatedStreamingConfig, ClientStatistics, HAPTICS, NegotiatedStreamingConfigExt,
-    RealTimeConfig, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VideoPacketHeader,
+    ClientNegotiatedStreamingConfig, ClientStatistics, FRAME_TIMING, FrameTimingFeedback, HAPTICS,
+    NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS, ServerControlPacket,
+    StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile, Settings,
@@ -926,6 +926,8 @@ fn connection_pipeline(
         socket.subscribe_to_unreliable_stream::<TrackingData>(TRACKING, MAX_UNREAD_PACKETS);
     let mut statics_receiver =
         socket.subscribe_to_unreliable_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
+    let mut frame_timing_receiver = socket
+        .subscribe_to_unreliable_stream::<FrameTimingFeedback>(FRAME_TIMING, MAX_UNREAD_PACKETS);
 
     let (video_channel_sender, video_channel_receiver) =
         std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
@@ -1166,6 +1168,54 @@ fn connection_pipeline(
                     if let Some(graph) = report.graph {
                         alvr_events::send_event(EventType::GraphStatistics(graph));
                     }
+                }
+            }
+        }
+    });
+
+    // Older clients never send on this stream. The frame pacer then stays free running.
+    let frame_timing_thread = thread::spawn({
+        let ctx = Arc::clone(&ctx);
+        let client_hostname = client_hostname.clone();
+        move || {
+            while is_streaming(&client_hostname) {
+                let data = match frame_timing_receiver.recv(STREAMING_RECV_TIMEOUT) {
+                    Ok(data) => data,
+                    Err(ConnectionError::TryAgain(_)) => continue,
+                    Err(ConnectionError::Other(_)) => return,
+                };
+                let Ok(feedback) = data.get_header() else {
+                    continue;
+                };
+
+                let target_margin = {
+                    let settings = crate::settings_snapshot();
+                    let video = &settings.video;
+
+                    video
+                        .frame_pacing_phase_lock
+                        .as_option()
+                        .filter(|_| video.enforce_server_frame_pacing)
+                        .map(|config| {
+                            Duration::try_from_secs_f32(config.target_margin_ms / 1000.0)
+                                .unwrap_or_default()
+                        })
+                };
+
+                let now = Instant::now();
+                let phase_locked = ctx.frame_pacer.lock().as_mut().is_some_and(|pacer| {
+                    pacer.report_client_timing(
+                        feedback.display_period,
+                        feedback.latch_margin_low_s,
+                        target_margin,
+                        now,
+                    );
+
+                    pacer.is_phase_locked(now)
+                });
+
+                if let Some(stats) = &mut *ctx.statistics_manager.write() {
+                    stats.report_frame_timing(feedback, phase_locked);
                 }
             }
         }
@@ -1514,6 +1564,7 @@ fn connection_pipeline(
     microphone_thread.join().ok();
     tracking_receive_thread.join().ok();
     statistics_thread.join().ok();
+    frame_timing_thread.join().ok();
     real_time_update_thread.join().ok();
     control_receive_thread.join().ok();
     stream_receive_thread.join().ok();

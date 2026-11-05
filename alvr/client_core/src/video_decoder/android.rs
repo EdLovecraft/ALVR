@@ -23,7 +23,10 @@ use std::{
     ffi::c_void,
     ops::Deref,
     ptr,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU32, Ordering},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -108,6 +111,8 @@ pub struct VideoDecoderSource {
     image_queue: SharedImageQueue,
     frame_available: Arc<Condvar>,
     current_image: Option<QueuedImage>,
+    // Decoded frames discarded before display, by queue overflow or backlog recovery.
+    dropped_frames: Arc<AtomicU32>,
 }
 
 unsafe impl Send for VideoDecoderSource {}
@@ -133,6 +138,9 @@ impl VideoDecoderSource {
 
             image_queue_lock.dequeue()
         };
+        if discarded.is_some() {
+            self.dropped_frames.fetch_add(1, Ordering::Relaxed);
+        }
         drop(discarded);
 
         // Once dequeued, only this source can release the image. Producer-side overflow and error
@@ -149,6 +157,11 @@ impl VideoDecoderSource {
                     .cast(),
             )
         })
+    }
+
+    // Returns the number of decoded frames discarded since the previous call.
+    pub fn take_dropped_frames(&self) -> u32 {
+        self.dropped_frames.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -224,6 +237,7 @@ fn decoder_lifecycle(
     decoder_ready_notifier: Arc<Condvar>,
     image_queue: SharedImageQueue,
     frame_available: Arc<Condvar>,
+    dropped_frames: Arc<AtomicU32>,
     image_reader: &mut ImageReader,
 ) -> Result<()> {
     image_reader.set_image_listener(Box::new({
@@ -241,6 +255,7 @@ fn decoder_lifecycle(
 
             let overflow = image_queue.lock().discard_oldest_if_full();
             if overflow.is_some() {
+                dropped_frames.fetch_add(1, Ordering::Relaxed);
                 warn!("Video frame queue overflow!");
             }
             drop(overflow);
@@ -262,7 +277,12 @@ fn decoder_lifecycle(
                         // Check under the lock so teardown cannot clear the queue only for a late
                         // callback to repopulate it before the ImageReader is destroyed.
                         if running.value() {
-                            queue.push(queued_image)
+                            let discarded = queue.push(queued_image);
+                            if discarded.is_some() {
+                                dropped_frames.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            discarded
                         } else {
                             Some(queued_image)
                         }
@@ -412,6 +432,7 @@ pub fn video_decoder_split(
         MAX_ACQUIRED_IMAGES - 2,
     )));
     let frame_available = Arc::new(Condvar::new());
+    let dropped_frames = Arc::new(AtomicU32::new(0));
 
     let dequeue_thread = thread::spawn({
         let config = config.clone();
@@ -420,6 +441,7 @@ pub fn video_decoder_split(
         let decoder_ready_notifier = Arc::clone(&decoder_ready_notifier);
         let image_queue = Arc::clone(&image_queue);
         let frame_available = Arc::clone(&frame_available);
+        let dropped_frames = Arc::clone(&dropped_frames);
         move || {
             thread_priority::declare_current_thread(CriticalThreadKind::Decoder);
 
@@ -448,6 +470,7 @@ pub fn video_decoder_split(
                 decoder_ready_notifier,
                 Arc::clone(&image_queue),
                 frame_available,
+                dropped_frames,
                 &mut image_reader,
             ) {
                 frame_result_callback(Err(e));
@@ -481,6 +504,7 @@ pub fn video_decoder_split(
         image_queue,
         frame_available,
         current_image: None,
+        dropped_frames,
     };
 
     Ok((sink, source))

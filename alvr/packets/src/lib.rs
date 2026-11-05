@@ -25,6 +25,9 @@ pub const HAPTICS: u16 = 1;
 pub const AUDIO: u16 = 2;
 pub const VIDEO: u16 = 3;
 pub const STATISTICS: u16 = 4;
+// Packets on unknown streams are discarded by the receiver, so this stream can be added without
+// breaking peers that don't know it: without feedback the streamer keeps pacing on its own.
+pub const FRAME_TIMING: u16 = 5;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoStreamingCapabilitiesExt {
@@ -367,6 +370,29 @@ pub enum ClientConnectionsAction {
     RemoveEntry,
     UpdateCurrentIp(Option<IpAddr>),
     SetConnectionState(ConnectionState),
+}
+
+/// Client display timing, sent a few times per second. It lets the streamer pace frames so that
+/// they are ready shortly before the client latches them for display.
+///
+/// Counters are totals since the stream started, so a lost packet only delays an update.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct FrameTimingFeedback {
+    /// Client monotonic time of this snapshot, relative to the stream start. Used for rates.
+    pub client_time: Duration,
+    /// Display refresh period reported by the XR runtime.
+    pub display_period: Duration,
+    /// Display refreshes that latched a new video frame.
+    pub latched_frames: u64,
+    /// Display refreshes that found no new video frame and showed the previous one again.
+    pub repeated_frames: u64,
+    /// Decoded frames discarded before display (queue overflow or backlog recovery).
+    pub dropped_frames: u64,
+    /// Latch margin: time between a frame becoming ready and the deadline of the first refresh
+    /// that could have shown it. Negative when the frame missed that refresh. These are a low
+    /// percentile and the median over the last second, in seconds, if enough frames were latched.
+    pub latch_margin_low_s: Option<f32>,
+    pub latch_margin_median_s: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]

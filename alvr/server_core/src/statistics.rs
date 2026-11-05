@@ -1,6 +1,6 @@
 use alvr_common::{HEAD_ID, SlidingWindowAverage};
 use alvr_events::{BitrateDirectives, GraphStatistics, StatisticsSummary};
-use alvr_packets::ClientStatistics;
+use alvr_packets::{ClientStatistics, FrameTimingFeedback};
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},
@@ -40,6 +40,60 @@ struct BatteryData {
     is_plugged: bool,
 }
 
+// Client frame timing feedback, summarized at the statistics summary rate.
+#[derive(Default)]
+struct ClientFrameTiming {
+    latest: Option<FrameTimingFeedback>,
+    // Feedback at the previous summary. Counters are totals, so rates are differences.
+    summary_baseline: Option<FrameTimingFeedback>,
+    phase_locked: bool,
+}
+
+struct FrameTimingSummary {
+    repeated_fps: Option<f32>,
+    dropped_fps: Option<f32>,
+    latch_margin_low_ms: Option<f32>,
+    latch_margin_median_ms: Option<f32>,
+    phase_locked: bool,
+}
+
+impl ClientFrameTiming {
+    fn summarize(&mut self) -> FrameTimingSummary {
+        let latest = self.latest.as_ref();
+        let rates = latest
+            .zip(self.summary_baseline.as_ref())
+            .filter(|(latest, baseline)| latest.client_time > baseline.client_time)
+            .map(|(latest, baseline)| {
+                let seconds = (latest.client_time - baseline.client_time).as_secs_f32();
+                let rate =
+                    |current: u64, previous: u64| current.saturating_sub(previous) as f32 / seconds;
+
+                (
+                    rate(latest.repeated_frames, baseline.repeated_frames),
+                    rate(latest.dropped_frames, baseline.dropped_frames),
+                )
+            });
+
+        let summary = FrameTimingSummary {
+            repeated_fps: rates.map(|(repeated, _)| repeated),
+            dropped_fps: rates.map(|(_, dropped)| dropped),
+            latch_margin_low_ms: latest
+                .and_then(|latest| latest.latch_margin_low_s)
+                .map(|margin| margin * 1000.0),
+            latch_margin_median_ms: latest
+                .and_then(|latest| latest.latch_margin_median_s)
+                .map(|margin| margin * 1000.0),
+            phase_locked: self.phase_locked,
+        };
+
+        if let Some(latest) = latest {
+            self.summary_baseline = Some(latest.clone());
+        }
+
+        summary
+    }
+}
+
 // Owned snapshots let callers publish telemetry after releasing the statistics lock.
 #[derive(Default)]
 pub struct StatisticsReport {
@@ -63,6 +117,7 @@ pub struct StatisticsManager {
     steamvr_pipeline_latency: Duration,
     motion_to_photon_latency_average: SlidingWindowAverage<Duration>,
     last_throughput_directives: BitrateDirectives,
+    client_frame_timing: ClientFrameTiming,
 }
 
 impl StatisticsManager {
@@ -91,6 +146,7 @@ impl StatisticsManager {
                 max_history_size,
             ),
             last_throughput_directives: BitrateDirectives::default(),
+            client_frame_timing: ClientFrameTiming::default(),
         }
     }
 
@@ -177,6 +233,22 @@ impl StatisticsManager {
         self.last_throughput_directives = stats;
     }
 
+    pub fn report_frame_timing(&mut self, feedback: FrameTimingFeedback, phase_locked: bool) {
+        let timing = &mut self.client_frame_timing;
+
+        // A new stream restarts the client totals.
+        if timing
+            .latest
+            .as_ref()
+            .is_some_and(|latest| feedback.client_time < latest.client_time)
+        {
+            timing.summary_baseline = None;
+        }
+
+        timing.latest = Some(feedback);
+        timing.phase_locked = phase_locked;
+    }
+
     // Called every frame. Publishing the returned snapshots must happen outside the lock.
     pub fn report_statistics(&mut self, client_stats: ClientStatistics) -> StatisticsReport {
         self.report_statistics_at(client_stats, Instant::now())
@@ -234,6 +306,7 @@ impl StatisticsManager {
                 self.last_full_report_instant += FULL_REPORT_INTERVAL;
 
                 let interval_secs = FULL_REPORT_INTERVAL.as_secs_f32();
+                let frame_timing = self.client_frame_timing.summarize();
 
                 let summary = StatisticsSummary {
                     video_packets_total: self.video_packets_total,
@@ -262,6 +335,11 @@ impl StatisticsManager {
                         .cloned()
                         .unwrap_or_default()
                         .is_plugged,
+                    client_repeated_fps: frame_timing.repeated_fps,
+                    client_dropped_fps: frame_timing.dropped_fps,
+                    latch_margin_low_ms: frame_timing.latch_margin_low_ms,
+                    latch_margin_median_ms: frame_timing.latch_margin_median_ms,
+                    frame_pacing_phase_locked: frame_timing.phase_locked,
                 };
 
                 self.video_packets_partial_sum = 0;
@@ -469,5 +547,58 @@ mod tests {
         assert_eq!(next_summary.video_packets_total, 20);
         assert_eq!(next_summary.video_packets_per_sec, 0);
         assert_close(next_summary.video_mbits_per_sec, 0.0);
+    }
+
+    fn frame_timing(client_ms: u64, repeated: u64, dropped: u64) -> FrameTimingFeedback {
+        FrameTimingFeedback {
+            client_time: Duration::from_millis(client_ms),
+            display_period: Duration::from_millis(10),
+            latched_frames: 0,
+            repeated_frames: repeated,
+            dropped_frames: dropped,
+            latch_margin_low_s: Some(0.0015),
+            latch_margin_median_s: Some(0.004),
+        }
+    }
+
+    #[test]
+    fn summaries_report_client_frame_timing() {
+        let (mut stats, client, start) = sample_frame();
+
+        // Without a baseline only the margins and the lock state are known.
+        stats.report_frame_timing(frame_timing(1000, 10, 2), true);
+        let first = stats
+            .report_statistics_at(client.clone(), start + FULL_REPORT_INTERVAL + EPS_INTERVAL)
+            .summary
+            .unwrap();
+        assert_eq!(first.client_repeated_fps, None);
+        assert_eq!(first.client_dropped_fps, None);
+        assert_close(first.latch_margin_low_ms.unwrap(), 1.5);
+        assert_close(first.latch_margin_median_ms.unwrap(), 4.0);
+        assert!(first.frame_pacing_phase_locked);
+
+        // Five repeats and one drop over 500 ms of client time.
+        stats.report_frame_timing(frame_timing(1500, 15, 3), false);
+        let second = stats
+            .report_statistics_at(client, start + FULL_REPORT_INTERVAL * 2 + EPS_INTERVAL)
+            .summary
+            .unwrap();
+        assert_close(second.client_repeated_fps.unwrap(), 10.0);
+        assert_close(second.client_dropped_fps.unwrap(), 2.0);
+        assert!(!second.frame_pacing_phase_locked);
+    }
+
+    #[test]
+    fn summaries_without_client_frame_timing_report_none() {
+        let (mut stats, client, start) = sample_frame();
+
+        let summary = stats
+            .report_statistics_at(client, start + FULL_REPORT_INTERVAL + EPS_INTERVAL)
+            .summary
+            .unwrap();
+
+        assert_eq!(summary.client_repeated_fps, None);
+        assert_eq!(summary.latch_margin_low_ms, None);
+        assert!(!summary.frame_pacing_phase_locked);
     }
 }

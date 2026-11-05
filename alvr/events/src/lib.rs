@@ -18,6 +18,21 @@ pub struct StatisticsSummary {
     pub server_fps: u32,
     pub battery_hmd: u32,
     pub hmd_plugged: bool,
+    // Frame pacing, from the client's frame timing feedback. None if the client doesn't send it.
+    // Refreshes per second that showed the previous frame again.
+    #[serde(default)]
+    pub client_repeated_fps: Option<f32>,
+    // Decoded frames per second discarded by the client (queue overflow or backlog recovery).
+    #[serde(default)]
+    pub client_dropped_fps: Option<f32>,
+    // Time between frames becoming ready and the client's display deadline: 2nd percentile and
+    // median over the last second.
+    #[serde(default)]
+    pub latch_margin_low_ms: Option<f32>,
+    #[serde(default)]
+    pub latch_margin_median_ms: Option<f32>,
+    #[serde(default)]
+    pub frame_pacing_phase_locked: bool,
 }
 
 // Bitrate statistics minus the empirical output value

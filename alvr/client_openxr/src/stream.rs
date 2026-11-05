@@ -3,7 +3,7 @@ use crate::{
     interaction::{self, InteractionContext, InteractionSourcesConfig},
 };
 use alvr_client_core::{
-    ClientCoreContext, VideoFrameMetadata,
+    ClientCoreContext, FrameLatch, VideoFrameMetadata,
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
 use alvr_common::{
@@ -363,15 +363,29 @@ impl StreamContext {
         vsync_time: Duration,
     ) -> (ProjectionLayerBuilder<'_>, Duration) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
-        let frame_result = self.decoder.as_mut().and_then(|(_, source)| {
-            // Sample the runtime clock immediately before waiting, preserving time for rendering
-            // and xrEndFrame(). A zero timeout still dequeues an already available frame.
-            let timeout = decoder_wait_timeout(
-                frame_interval,
-                vsync_time,
-                crate::xr_runtime_now(self.xr_session.instance()).map(crate::from_xr_time),
-            );
-            source.get_frame_timeout(timeout)
+
+        // Sample the runtime clock immediately before waiting, preserving time for rendering and
+        // xrEndFrame(). A zero timeout still dequeues an already available frame.
+        let timeout = decoder_wait_timeout(
+            frame_interval,
+            vsync_time,
+            crate::xr_runtime_now(self.xr_session.instance()).map(crate::from_xr_time),
+        );
+        let latch_deadline = Instant::now() + timeout;
+        let (frame_result, dropped_frames) = match &mut self.decoder {
+            Some((_, source)) => (
+                source.get_frame_timeout(timeout),
+                source.take_dropped_frames(),
+            ),
+            None => (None, 0),
+        };
+        // Reported for every refresh, including those without a new frame, so the streamer can
+        // place its frames relative to this deadline.
+        self.core_context.report_frame_latch(FrameLatch {
+            deadline: latch_deadline,
+            frame_timestamp: frame_result.map(|(timestamp, _)| timestamp),
+            display_period: frame_interval,
+            dropped_frames,
         });
 
         let (timestamp, frame_metadata, buffer_ptr) =
