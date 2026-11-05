@@ -1152,15 +1152,13 @@ fn connection_pipeline(
                         ))
                         .ok();
 
-                    {
-                        let session_manager_lock = SESSION_MANAGER.read();
-                        ctx.bitrate_manager.lock().report_frame_latencies(
-                            &session_manager_lock.settings().video.bitrate.mode,
-                            timestamp,
-                            report.network_latency,
-                            decoder_latency,
-                        );
-                    }
+                    let settings = crate::settings_snapshot();
+                    ctx.bitrate_manager.lock().report_frame_latencies(
+                        &settings.video.bitrate.mode,
+                        timestamp,
+                        report.network_latency,
+                        decoder_latency,
+                    );
 
                     if let Some(summary) = report.summary {
                         alvr_events::send_event(EventType::StatisticsSummary(summary));
