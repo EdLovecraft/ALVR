@@ -15,6 +15,7 @@ mod storage;
 #[cfg(target_os = "android")]
 mod audio;
 
+pub mod thread_priority;
 pub mod video_decoder;
 
 use alvr_common::{

@@ -6,6 +6,7 @@ use crate::{
     sockets::AnnouncerSocket,
     statistics::StatisticsManager,
     storage::Config,
+    thread_priority::{self, CriticalThreadKind},
 };
 use alvr_common::{
     ALVR_VERSION, AnyhowToCon, ConResult, ConnectionError, ConnectionState, LifecycleState,
@@ -322,6 +323,8 @@ fn connection_pipeline(
     let video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         move || {
+            thread_priority::declare_current_thread(CriticalThreadKind::NetworkReceive);
+
             let mut stream_corrupted = true;
             while is_streaming(&ctx) {
                 let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
@@ -585,6 +588,8 @@ fn connection_pipeline(
         let event_queue = Arc::clone(&event_queue);
         let disconnect_notif = Arc::clone(&disconnect_notif);
         move || {
+            thread_priority::declare_current_thread(CriticalThreadKind::NetworkReceive);
+
             while is_streaming(&ctx) {
                 match stream_socket.recv() {
                     Ok(()) => (),

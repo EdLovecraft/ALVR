@@ -1,4 +1,5 @@
 use super::{VideoDecoderConfig, frame_queue::FrameQueue};
+use crate::thread_priority::{self, CriticalThreadKind};
 use alvr_common::{
     RelaxedAtomic, ToAny,
     anyhow::{Context, Result, anyhow, bail},
@@ -18,6 +19,7 @@ use ndk::{
     },
 };
 use std::{
+    cell::Cell,
     ffi::c_void,
     ops::Deref,
     ptr,
@@ -25,6 +27,11 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+thread_local! {
+    // The ImageReader invokes its listener on a thread it owns. Declare it once, on first use.
+    static LISTENER_THREAD_DECLARED: Cell<bool> = const { Cell::new(false) };
+}
 
 struct FakeThreadSafe<T>(T);
 unsafe impl<T> Send for FakeThreadSafe<T> {}
@@ -228,6 +235,10 @@ fn decoder_lifecycle(
                 return;
             }
 
+            if !LISTENER_THREAD_DECLARED.replace(true) {
+                thread_priority::declare_current_thread(CriticalThreadKind::Decoder);
+            }
+
             let overflow = image_queue.lock().discard_oldest_if_full();
             if overflow.is_some() {
                 warn!("Video frame queue overflow!");
@@ -410,6 +421,8 @@ pub fn video_decoder_split(
         let image_queue = Arc::clone(&image_queue);
         let frame_available = Arc::clone(&frame_available);
         move || {
+            thread_priority::declare_current_thread(CriticalThreadKind::Decoder);
+
             let mut image_reader = match ImageReader::new_with_usage(
                 1,
                 1,

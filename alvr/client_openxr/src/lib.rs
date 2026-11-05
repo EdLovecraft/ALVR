@@ -7,7 +7,7 @@ mod passthrough;
 mod stream;
 
 use crate::stream::ParsedStreamConfig;
-use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
+use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent, thread_priority};
 use alvr_common::{
     Fov, HAND_LEFT_ID, Pose, debug, error,
     glam::{Quat, UVec2, Vec3},
@@ -139,6 +139,64 @@ fn default_view() -> xr::View {
     }
 }
 
+#[cfg(target_os = "android")]
+fn set_android_thread_type(
+    thread_settings: xr::raw::AndroidThreadSettingsKHR,
+    xr_session: xr::sys::Session,
+    thread_type: xr::AndroidThreadTypeKHR,
+) {
+    let thread_id = unsafe { libc::gettid() } as u32;
+    let result = unsafe {
+        (thread_settings.set_android_application_thread)(xr_session, thread_type, thread_id)
+    };
+    if result.into_raw() < 0 {
+        alvr_common::warn!("Failed to declare thread {thread_id} as {thread_type:?}: {result:?}");
+    }
+}
+
+// Declares the calling thread to the runtime (XR_KHR_android_thread_settings), which can then
+// schedule it as part of the frame-critical path instead of as a generic app thread.
+#[cfg_attr(not(target_os = "android"), expect(unused_variables))]
+fn declare_xr_thread(
+    xr_session: &xr::Session<xr::OpenGlEs>,
+    thread_type: xr::AndroidThreadTypeKHR,
+) {
+    #[cfg(target_os = "android")]
+    if let Some(thread_settings) = xr_session.instance().exts().khr_android_thread_settings {
+        set_android_thread_type(thread_settings, xr_session.as_raw(), thread_type);
+    }
+}
+
+// Declares the calling (render) thread, and lets client_core declare its video path threads while
+// the session is running.
+fn declare_xr_render_threads(xr_session: &xr::Session<xr::OpenGlEs>) {
+    declare_xr_thread(xr_session, xr::AndroidThreadTypeKHR::RENDERER_MAIN);
+
+    #[cfg(target_os = "android")]
+    if let Some(thread_settings) = xr_session.instance().exts().khr_android_thread_settings {
+        use thread_priority::CriticalThreadKind;
+
+        let raw_session = xr_session.as_raw();
+        thread_priority::set_critical_thread_hook(Some(Box::new(move |kind| {
+            let thread_type = match kind {
+                CriticalThreadKind::NetworkReceive => xr::AndroidThreadTypeKHR::APPLICATION_WORKER,
+                CriticalThreadKind::Decoder => xr::AndroidThreadTypeKHR::RENDERER_WORKER,
+            };
+            set_android_thread_type(thread_settings, raw_session, thread_type);
+        })));
+    }
+}
+
+// The critical thread hook captures the raw session handle. Declared right after the session, this
+// guard removes the hook before the session can be destroyed, on every exit path.
+struct CriticalThreadHookGuard;
+
+impl Drop for CriticalThreadHookGuard {
+    fn drop(&mut self) {
+        thread_priority::set_critical_thread_hook(None);
+    }
+}
+
 // This exists to circumvent dead-code analysis
 fn create_session(
     xr_instance: &xr::Instance,
@@ -220,6 +278,7 @@ pub fn entry_point() {
     #[cfg(target_os = "android")]
     {
         selected_exts.khr_android_create_instance = true;
+        selected_exts.khr_android_thread_settings = true;
     }
     selected_exts.khr_convert_timespec_time = true;
     selected_exts.khr_opengl_es_enable = true;
@@ -293,6 +352,7 @@ pub fn entry_point() {
 
         let (xr_session, mut xr_frame_waiter, mut xr_frame_stream) =
             create_session(&xr_instance, xr_system, &graphics_context);
+        let _critical_thread_hook_guard = CriticalThreadHookGuard;
 
         let views_config = xr_instance
             .enumerate_view_configuration_views(
@@ -425,6 +485,9 @@ pub fn entry_point() {
                                 .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
                                 .unwrap();
 
+                            // Before resuming: the connection threads declare themselves on start.
+                            declare_xr_render_threads(&xr_session);
+
                             core_context.resume();
 
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
@@ -437,6 +500,8 @@ pub fn entry_point() {
                             passthrough_layer = None;
 
                             core_context.pause();
+
+                            thread_priority::set_critical_thread_hook(None);
 
                             xr_session.end().ok();
                         }
