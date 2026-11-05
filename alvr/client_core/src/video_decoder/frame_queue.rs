@@ -1,5 +1,10 @@
 use std::{collections::VecDeque, mem};
 
+// The backlog average decays slowly, so right after a discard it still reads above the limit.
+// Without a pause it would discard again on the next refreshes, and two frames skipped back to
+// back are much more visible than the same skips spread out.
+const BACKLOG_DISCARD_COOLDOWN: u32 = 4;
+
 // Only pending frames live here. A dequeued frame is owned by the consumer, so neither overflow
 // recovery nor clearing this queue can release a buffer that is still being rendered.
 pub(super) struct FrameQueue<T> {
@@ -8,6 +13,8 @@ pub(super) struct FrameQueue<T> {
     max_buffering_frames: f32,
     buffering_history_weight: f32,
     buffering_running_average: f32,
+    // Dequeues left before backlog recovery may discard again.
+    discard_cooldown: u32,
 }
 
 impl<T> FrameQueue<T> {
@@ -22,6 +29,7 @@ impl<T> FrameQueue<T> {
             max_buffering_frames,
             buffering_history_weight,
             buffering_running_average: 0.0,
+            discard_cooldown: 0,
         }
     }
 
@@ -53,9 +61,15 @@ impl<T> FrameQueue<T> {
             * self.buffering_history_weight
             + buffered_frames as f32 * (1. - self.buffering_history_weight);
 
-        let discarded = if self.frames.len() > 1
+        let discarded = if self.discard_cooldown > 0 {
+            self.discard_cooldown -= 1;
+
+            None
+        } else if self.frames.len() > 1
             && self.buffering_running_average > self.max_buffering_frames
         {
+            self.discard_cooldown = BACKLOG_DISCARD_COOLDOWN;
+
             self.frames.pop_front()
         } else {
             None
@@ -66,6 +80,7 @@ impl<T> FrameQueue<T> {
 
     pub fn clear(&mut self) -> VecDeque<T> {
         self.buffering_running_average = 0.0;
+        self.discard_cooldown = 0;
         mem::take(&mut self.frames)
     }
 }
@@ -78,17 +93,42 @@ mod tests {
     #[test]
     fn stale_average_never_discards_the_only_frame() {
         let mut queue = FrameQueue::new(2.0, 0.90, 8);
-        queue.buffering_running_average = 3. * (1. - 0.90_f32.powi(20));
+        queue.buffering_running_average = 3.0;
 
-        for frame in 0..3 {
-            assert!(queue.push(frame).is_none());
-        }
-        assert_eq!(queue.dequeue(), (Some(1), Some(0)));
-        assert!(queue.push(3).is_none());
-        assert_eq!(queue.dequeue(), (Some(3), Some(2)));
-        assert!(queue.push(4).is_none());
-        assert_eq!(queue.dequeue(), (Some(4), None));
+        assert!(queue.push(0).is_none());
+        assert_eq!(queue.dequeue(), (Some(0), None));
         assert!(queue.buffering_running_average > 2.0);
+    }
+
+    #[test]
+    fn backlog_discards_are_spread_out() {
+        let mut queue = FrameQueue::new(2.0, 0.90, 8);
+        let mut next_frame = 0;
+        let mut discards = vec![];
+
+        // A network stall delivers four frames at once, then one frame arrives per refresh.
+        for refresh in 0..60 {
+            let arrivals = match refresh {
+                0..5 => 1,
+                5..8 => 0,
+                8 => 4,
+                _ => 1,
+            };
+            for _ in 0..arrivals {
+                assert!(queue.push(next_frame).is_none());
+                next_frame += 1;
+            }
+
+            let (_, discarded) = queue.dequeue();
+            if discarded.is_some() {
+                discards.push(refresh);
+            }
+        }
+
+        // The backlog of three is reduced to one, without skipping on back to back refreshes.
+        assert_eq!(discards.len(), 2);
+        assert!(discards[1] - discards[0] > BACKLOG_DISCARD_COOLDOWN as usize);
+        assert_eq!(queue.frames.len(), 1);
     }
 
     #[test]
