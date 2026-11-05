@@ -62,6 +62,17 @@ impl VideoDecoderSource {
         #[cfg(not(target_os = "android"))]
         None
     }
+
+    /// Number of decoded frames discarded before display (queue overflow or backlog recovery)
+    /// since the previous call.
+    pub fn take_dropped_frames(&self) -> u32 {
+        #[cfg(target_os = "android")]
+        {
+            self.inner.take_dropped_frames()
+        }
+        #[cfg(not(target_os = "android"))]
+        0
+    }
 }
 
 // report_frame_decoded: (target_timestamp: Duration) -> ()

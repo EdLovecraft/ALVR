@@ -4,7 +4,7 @@ use crate::{
     ClientCapabilities, ClientCoreEvent, VideoFrameMetadata,
     logging_backend::{LOG_CHANNEL_SENDER, LogMirrorData},
     sockets::AnnouncerSocket,
-    statistics::StatisticsManager,
+    statistics::{FrameLatch, StatisticsManager},
     storage::Config,
     thread_priority::{self, CriticalThreadKind},
 };
@@ -16,8 +16,9 @@ use alvr_common::{
 };
 use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientControlPacket, ClientStatistics, ConnectionAcceptedInfo,
-    HAPTICS, Haptics, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VideoPacketHeader, VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
+    FRAME_TIMING, FrameTimingFeedback, HAPTICS, Haptics, STATISTICS, ServerControlPacket,
+    StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
+    VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
 use alvr_sockets::{
@@ -60,13 +61,19 @@ const STATISTICS_QUEUE_CAPACITY: usize = 1;
 
 pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
 
+// Client to streamer telemetry, sent by a connection-scoped worker.
+pub enum ClientTelemetry {
+    Frame(ClientStatistics),
+    FrameTiming(FrameTimingFeedback),
+}
+
 #[derive(Default)]
 pub struct ConnectionContext {
     pub state: RwLock<ConnectionState>,
     pub disconnected_notif: Condvar,
     pub control_sender: Mutex<Option<ControlSocketSender<ClientControlPacket>>>,
     pub tracking_sender: Mutex<Option<StreamSender<TrackingData>>>,
-    pub statistics_sender: Mutex<Option<mpsc::SyncSender<ClientStatistics>>>,
+    pub statistics_sender: Mutex<Option<mpsc::SyncSender<ClientTelemetry>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
     pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
     pub video_frame_metadata_queue: Mutex<VecDeque<(Duration, VideoFrameMetadata)>>,
@@ -88,7 +95,22 @@ impl ConnectionContext {
         {
             // No socket access or logging on the submission path. A full or disconnected channel
             // only loses telemetry; local prediction statistics have already been updated.
-            sender.try_send(summary).ok();
+            sender.try_send(ClientTelemetry::Frame(summary)).ok();
+        }
+    }
+
+    pub fn report_frame_latch(&self, latch: FrameLatch) {
+        let feedback = self
+            .statistics_manager
+            .lock()
+            .as_mut()
+            .and_then(|stats| stats.report_frame_latch(latch));
+
+        if let Some(feedback) = feedback
+            && let Some(sender) = &*self.statistics_sender.lock()
+        {
+            // Counters are totals, so a full queue only delays this update.
+            sender.try_send(ClientTelemetry::FrameTiming(feedback)).ok();
         }
     }
 }
@@ -112,8 +134,8 @@ fn is_streaming(ctx: &ConnectionContext) -> bool {
 
 fn statistics_send_loop(
     ctx: &ConnectionContext,
-    receiver: mpsc::Receiver<ClientStatistics>,
-    mut send: impl FnMut(&ClientStatistics) -> bool,
+    receiver: mpsc::Receiver<ClientTelemetry>,
+    mut send: impl FnMut(&ClientTelemetry) -> bool,
 ) {
     while is_streaming(ctx) {
         let packet = match receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
@@ -315,6 +337,7 @@ fn connection_pipeline(
     let mut haptics_receiver =
         stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
     let mut statistics_sender = stream_socket.request_stream(STATISTICS);
+    let mut frame_timing_sender = stream_socket.request_stream(FRAME_TIMING);
     let (statistics_channel_sender, statistics_channel_receiver) =
         mpsc::sync_channel(STATISTICS_QUEUE_CAPACITY);
 
@@ -469,8 +492,13 @@ fn connection_pipeline(
     let statistics_send_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         move || {
-            statistics_send_loop(&ctx, statistics_channel_receiver, |packet| {
-                statistics_sender.send_header(packet).is_ok()
+            statistics_send_loop(&ctx, statistics_channel_receiver, |packet| match packet {
+                ClientTelemetry::Frame(statistics) => {
+                    statistics_sender.send_header(statistics).is_ok()
+                }
+                ClientTelemetry::FrameTiming(feedback) => {
+                    frame_timing_sender.send_header(feedback).is_ok()
+                }
             });
         }
     });
@@ -668,6 +696,20 @@ mod tests {
         ctx
     }
 
+    fn frame_statistics(packet: ClientTelemetry) -> ClientStatistics {
+        match packet {
+            ClientTelemetry::Frame(statistics) => statistics,
+            ClientTelemetry::FrameTiming(_) => panic!("Expected frame statistics"),
+        }
+    }
+
+    fn frame_timestamp(packet: &ClientTelemetry) -> Option<Duration> {
+        match packet {
+            ClientTelemetry::Frame(statistics) => Some(statistics.target_timestamp),
+            ClientTelemetry::FrameTiming(_) => None,
+        }
+    }
+
     #[test]
     fn submit_enqueues_a_statistics_snapshot() {
         let ctx = statistics_context();
@@ -678,7 +720,7 @@ mod tests {
 
         ctx.report_submit(timestamp, vsync_queue);
 
-        let packet = receiver.try_recv().unwrap();
+        let packet = frame_statistics(receiver.try_recv().unwrap());
         assert_eq!(packet.target_timestamp, timestamp);
         assert_eq!(packet.vsync_queue, vsync_queue);
         assert!(packet.total_pipeline_latency >= vsync_queue);
@@ -734,7 +776,7 @@ mod tests {
             let ctx = Arc::clone(&ctx);
             move || {
                 statistics_send_loop(&ctx, receiver, |packet| {
-                    started_sender.send(packet.target_timestamp).unwrap();
+                    started_sender.send(frame_timestamp(packet)).unwrap();
                     // Model a socket send stalled on network I/O or the shared socket lock.
                     resume_receiver.recv().is_ok()
                 });
@@ -750,7 +792,7 @@ mod tests {
             worker.join().unwrap();
             panic!("Statistics worker did not start");
         }
-        assert_eq!(started.unwrap(), Duration::from_secs(1));
+        assert_eq!(started.unwrap(), Some(Duration::from_secs(1)));
 
         let (done_sender, done_receiver) = mpsc::channel();
         let producer = thread::spawn({
@@ -786,6 +828,37 @@ mod tests {
             started_receiver.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn frame_latches_enqueue_periodic_timing_feedback() {
+        let ctx = statistics_context();
+        let (sender, receiver) = mpsc::sync_channel(STATISTICS_QUEUE_CAPACITY);
+        *ctx.statistics_sender.lock() = Some(sender);
+        let latch = |frame_timestamp| FrameLatch {
+            deadline: Instant::now(),
+            frame_timestamp,
+            display_period: Duration::from_millis(10),
+            dropped_frames: 1,
+        };
+
+        ctx.report_frame_latch(latch(Some(Duration::from_secs(1))));
+        // Feedback is only sent every 250 ms.
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        thread::sleep(Duration::from_millis(260));
+        ctx.report_frame_latch(latch(None));
+
+        let ClientTelemetry::FrameTiming(feedback) = receiver.try_recv().unwrap() else {
+            panic!("Expected frame timing feedback");
+        };
+        assert_eq!(feedback.latched_frames, 1);
+        assert_eq!(feedback.repeated_frames, 1);
+        assert_eq!(feedback.dropped_frames, 2);
+        assert_eq!(feedback.display_period, Duration::from_millis(10));
     }
 
     #[test]

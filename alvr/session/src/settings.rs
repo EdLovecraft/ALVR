@@ -680,6 +680,15 @@ pub struct UpscalingConfig {
     pub upscale_factor: f32,
 }
 
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct FramePacingPhaseLockConfig {
+    #[schema(strings(
+        help = "Time kept between nearly all frames becoming ready and the moment the headset needs them. Higher values absorb more network and decoder jitter at the cost of latency."
+    ))]
+    #[schema(gui(slider(min = 0.0, max = 10.0, step = 0.1)), suffix = "ms")]
+    pub target_margin_ms: f32,
+}
+
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct VideoConfig {
     #[schema(flag = "real-time")]
@@ -723,6 +732,14 @@ For eye-tracked foveation, enable Headset > Face tracking > Sink > Eye-tracked f
     ))]
     #[schema(flag = "real-time")]
     pub enforce_server_frame_pacing: bool,
+
+    #[cfg_attr(not(target_os = "windows"), schema(flag = "hidden"))]
+    #[schema(strings(
+        display_name = "Display phase lock",
+        help = r"This works only on Windows and requires server frame pacing. Uses timing feedback from the headset to release frames so that they become ready shortly before the headset needs them. This removes pacing drift between the PC and the headset, and drains standing frame queues without skipping frames. Without feedback (older clients) pacing falls back to its free-running behavior."
+    ))]
+    #[schema(flag = "real-time")]
+    pub frame_pacing_phase_lock: Switch<FramePacingPhaseLockConfig>,
 
     #[schema(flag = "steamvr-restart")]
     pub encoder_config: EncoderConfig,
@@ -1717,6 +1734,12 @@ pub fn session_settings_default() -> SettingsDefault {
             max_buffering_frames: 2.0,
             buffering_history_weight: 0.90,
             enforce_server_frame_pacing: true,
+            frame_pacing_phase_lock: SwitchDefault {
+                enabled: true,
+                content: FramePacingPhaseLockConfigDefault {
+                    target_margin_ms: 1.0,
+                },
+            },
             bitrate: BitrateConfigDefault {
                 gui_collapsed: false,
                 mode: BitrateModeDefault {

@@ -466,6 +466,34 @@ impl StatisticsTab {
             ui[0].label("Streamer FPS:");
             ui[1].label(format!("{} FPS", statistics.server_fps));
 
+            // Client frame timing feedback, absent with clients that don't send it.
+            let per_second = |value: Option<f32>| {
+                value.map_or_else(|| "n/a".into(), |value| format!("{value:.1} /s"))
+            };
+            let milliseconds = |value: Option<f32>| {
+                value.map_or_else(|| "n/a".into(), |value| format!("{value:.1} ms"))
+            };
+
+            ui[0].label("Repeated frames:");
+            ui[1].label(per_second(statistics.client_repeated_fps));
+
+            ui[0].label("Dropped frames:");
+            ui[1].label(per_second(statistics.client_dropped_fps));
+
+            ui[0].label("Frame ready margin:");
+            ui[1].label(format!(
+                "{} (2nd percentile), {} (median)",
+                milliseconds(statistics.latch_margin_low_ms),
+                milliseconds(statistics.latch_margin_median_ms)
+            ));
+
+            ui[0].label("Display phase lock:");
+            ui[1].label(if statistics.frame_pacing_phase_locked {
+                "locked"
+            } else {
+                "free running"
+            });
+
             ui[0].label("Headset battery");
             ui[1].label(format!(
                 "{}% ({})",

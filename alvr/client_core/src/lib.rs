@@ -38,6 +38,7 @@ use std::{
 use storage::Config;
 
 pub use logging_backend::init_logging;
+pub use statistics::FrameLatch;
 
 pub enum ClientCoreEvent {
     UpdateHudMessage(String),
@@ -307,6 +308,14 @@ impl ClientCoreContext {
 
         self.connection_context
             .report_submit(timestamp, vsync_queue);
+    }
+
+    /// Call once per display refresh while streaming, after waiting for a decoded frame. This is
+    /// the timing feedback the streamer uses to align its frame pacing to the display.
+    pub fn report_frame_latch(&self, latch: FrameLatch) {
+        dbg_client_core!("report_frame_latch");
+
+        self.connection_context.report_frame_latch(latch);
     }
 
     pub fn platform(&self) -> Platform {
