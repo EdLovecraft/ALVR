@@ -170,6 +170,39 @@ pub fn settings() -> Settings {
     SESSION_MANAGER.read().settings().clone()
 }
 
+// Session writers convert, serialize and save session.json while holding the write lock, and
+// parking_lot's fair RwLock also blocks new readers while a writer is waiting. Latency-critical
+// threads (compositor, encoder, tracking, statistics) therefore never wait for the lock: if it is
+// not immediately available they keep using the previous snapshot.
+fn latest_settings(
+    session_manager: &RwLock<ServerSessionManager>,
+    last_snapshot: &Mutex<Option<Arc<Settings>>>,
+) -> Arc<Settings> {
+    if let Some(session_manager) = session_manager.try_read() {
+        let settings = session_manager.settings_arc();
+        drop(session_manager);
+
+        // Another hot thread may be refreshing the cache with the same snapshot.
+        if let Some(mut last_snapshot) = last_snapshot.try_lock() {
+            *last_snapshot = Some(Arc::clone(&settings));
+        }
+
+        return settings;
+    }
+
+    let cached = last_snapshot.lock().clone();
+
+    // Waiting is only possible before the first snapshot has been taken.
+    cached.unwrap_or_else(|| session_manager.read().settings_arc())
+}
+
+/// Settings for latency-critical paths. Never waits for a session write in progress.
+pub fn settings_snapshot() -> Arc<Settings> {
+    static LAST_SNAPSHOT: Mutex<Option<Arc<Settings>>> = Mutex::new(None);
+
+    latest_settings(&SESSION_MANAGER, &LAST_SNAPSHOT)
+}
+
 pub fn steamvr_hmd_init_config() -> SteamvrHmdInitConfig {
     SESSION_MANAGER
         .read()
@@ -321,8 +354,7 @@ impl ServerCoreContext {
             .map(|stats| stats.motion_to_photon_latency_average())
             .unwrap_or_default();
 
-        let max_prediction =
-            Duration::from_millis(SESSION_MANAGER.read().settings().headset.max_prediction_ms);
+        let max_prediction = Duration::from_millis(settings_snapshot().headset.max_prediction_ms);
 
         if latency > max_prediction {
             warn!("Latency is too high. Clamping prediction");
@@ -348,9 +380,9 @@ impl ServerCoreContext {
         dbg_server_core!("send_haptics");
 
         let haptics_config = {
-            let session_manager_lock = SESSION_MANAGER.read();
+            let settings = settings_snapshot();
 
-            if session_manager_lock.settings().extra.logging.log_haptics {
+            if settings.extra.logging.log_haptics {
                 alvr_events::send_event(EventType::Haptics(HapticsEvent {
                     path: DEVICE_ID_TO_PATH.get(&haptics.device_id).map_or_else(
                         || format!("Unknown (ID: {:#16x})", haptics.device_id),
@@ -362,8 +394,7 @@ impl ServerCoreContext {
                 }))
             }
 
-            session_manager_lock
-                .settings()
+            settings
                 .headset
                 .controllers
                 .as_option()
@@ -415,17 +446,13 @@ impl ServerCoreContext {
 
         if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
             let buffer_size = nal_buffer.len();
+            let settings = settings_snapshot();
 
             if is_idr {
                 STREAM_CORRUPTED.store(false, Ordering::SeqCst);
             }
 
-            if let Switch::Enabled(config) = &SESSION_MANAGER
-                .read()
-                .settings()
-                .extra
-                .capture
-                .rolling_video_files
+            if let Switch::Enabled(config) = &settings.extra.capture.rolling_video_files
                 && Instant::now()
                     > *LAST_IDR_INSTANT.lock() + Duration::from_secs(config.duration_s)
             {
@@ -435,20 +462,13 @@ impl ServerCoreContext {
                     .ok();
 
                 if is_idr {
-                    create_recording_file(
-                        &self.connection_context,
-                        SESSION_MANAGER.read().settings(),
-                    );
+                    create_recording_file(&self.connection_context, &settings);
                     *LAST_IDR_INSTANT.lock() = Instant::now();
                 }
             }
 
             if !STREAM_CORRUPTED.load(Ordering::SeqCst)
-                || !SESSION_MANAGER
-                    .read()
-                    .settings()
-                    .connection
-                    .avoid_video_glitching
+                || !settings.connection.avoid_video_glitching
             {
                 if let Some(sender) = &*self.connection_context.video_mirror_sender.lock() {
                     sender.send(nal_buffer.clone()).ok();
@@ -494,13 +514,12 @@ impl ServerCoreContext {
     pub fn get_dynamic_encoder_params(&self) -> Option<DynamicEncoderParams> {
         dbg_server_core!("get_dynamic_encoder_params");
 
-        let pair = {
-            let session_manager_lock = SESSION_MANAGER.read();
-            self.connection_context
-                .bitrate_manager
-                .lock()
-                .get_encoder_params(&session_manager_lock.settings().video.bitrate)
-        };
+        let settings = settings_snapshot();
+        let pair = self
+            .connection_context
+            .bitrate_manager
+            .lock()
+            .get_encoder_params(&settings.video.bitrate);
 
         pair.map(|(params, stats)| {
             if let Some(stats_manager) = &mut *self.connection_context.statistics_manager.write() {
@@ -525,17 +544,11 @@ impl ServerCoreContext {
             stats.report_frame_present(target_timestamp, offset);
         }
 
-        let session_manager_lock = SESSION_MANAGER.read();
+        let settings = settings_snapshot();
         self.connection_context
             .bitrate_manager
             .lock()
-            .report_frame_present(
-                &session_manager_lock
-                    .settings()
-                    .video
-                    .bitrate
-                    .adapt_to_framerate,
-            );
+            .report_frame_present(&settings.video.bitrate.adapt_to_framerate);
     }
 
     pub fn claim_next_vsync_slot(&self, throttle_frames: u32) -> Option<Duration> {
@@ -612,5 +625,57 @@ impl Drop for ServerCoreContext {
         }
 
         self.webserver_runtime.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_manager() -> RwLock<ServerSessionManager> {
+        RwLock::new(ServerSessionManager::new(None))
+    }
+
+    #[test]
+    fn settings_snapshot_reads_the_session_when_it_is_free() {
+        let session_manager = session_manager();
+        let last_snapshot = Mutex::new(None);
+
+        let settings = latest_settings(&session_manager, &last_snapshot);
+
+        assert!(Arc::ptr_eq(
+            &settings,
+            &session_manager.read().settings_arc()
+        ));
+        assert!(
+            last_snapshot
+                .lock()
+                .as_ref()
+                .is_some_and(|last| Arc::ptr_eq(last, &settings))
+        );
+    }
+
+    #[test]
+    fn settings_snapshot_does_not_wait_for_a_session_writer() {
+        let session_manager = session_manager();
+        let last_snapshot = Mutex::new(None);
+        let before = latest_settings(&session_manager, &last_snapshot);
+        let original_fps = before.video.preferred_fps;
+
+        {
+            let mut writer = session_manager.write();
+            writer.session_mut().session_settings.video.preferred_fps = original_fps + 1.0;
+
+            // A reader on a latency-critical thread must return immediately with the previous
+            // snapshot while the writer still holds the lock.
+            let during_write = latest_settings(&session_manager, &last_snapshot);
+            assert!(Arc::ptr_eq(&during_write, &before));
+        }
+
+        let after = latest_settings(&session_manager, &last_snapshot);
+        assert!(!Arc::ptr_eq(&after, &before));
+        assert_eq!(after.video.preferred_fps, original_fps + 1.0);
+        // The snapshot taken earlier is not mutated by the write.
+        assert_eq!(before.video.preferred_fps, original_fps);
     }
 }

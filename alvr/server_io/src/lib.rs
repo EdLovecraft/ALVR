@@ -21,6 +21,7 @@ use std::{
     fs,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 fn save_session(session: &SessionConfig, path: &Path) -> Result<()> {
@@ -33,7 +34,7 @@ fn save_session(session: &SessionConfig, path: &Path) -> Result<()> {
 pub struct SessionLock<'a> {
     session_desc: &'a mut SessionConfig,
     session_path: Option<&'a Path>,
-    settings: &'a mut Settings,
+    settings: &'a mut Arc<Settings>,
 }
 
 impl Deref for SessionLock<'_> {
@@ -55,7 +56,7 @@ impl Drop for SessionLock<'_> {
             save_session(self.session_desc, session_path).ok();
         }
 
-        *self.settings = self.session_desc.to_settings();
+        *self.settings = Arc::new(self.session_desc.to_settings());
         alvr_events::send_event(EventType::Session(Box::new(self.session_desc.clone())));
     }
 }
@@ -67,7 +68,8 @@ impl Drop for SessionLock<'_> {
 // write need to happen on separate threads, a critical region should be implemented.
 pub struct ServerSessionManager {
     session_config: SessionConfig,
-    settings: Settings,
+    // Shared so readers can keep a snapshot without holding the session lock.
+    settings: Arc<Settings>,
     session_path: Option<PathBuf>,
 }
 
@@ -83,7 +85,7 @@ impl ServerSessionManager {
 
         Self {
             session_config: session_config.clone(),
-            settings: session_config.to_settings(),
+            settings: Arc::new(session_config.to_settings()),
             session_path,
         }
     }
@@ -152,6 +154,12 @@ impl ServerSessionManager {
         &self.settings
     }
 
+    // A settings snapshot that stays valid after the session lock is released. Session writes
+    // replace it instead of mutating it.
+    pub fn settings_arc(&self) -> Arc<Settings> {
+        Arc::clone(&self.settings)
+    }
+
     // Note: "value" can be any session subtree, in json format.
     pub fn set_session_values(&mut self, descs: Vec<PathValuePair>) -> Result<()> {
         let mut session_json = serde_json::to_value(self.session_config.clone()).unwrap();
@@ -176,7 +184,7 @@ impl ServerSessionManager {
 
         // session_json has been updated
         self.session_config = serde_json::from_value(session_json)?;
-        self.settings = self.session_config.to_settings();
+        self.settings = Arc::new(self.session_config.to_settings());
 
         if let Some(session_path) = &self.session_path {
             save_session(&self.session_config, session_path)?;

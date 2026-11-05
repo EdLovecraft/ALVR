@@ -286,7 +286,9 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     SetLocalViewParams(ffi_params.as_ptr());
                 },
                 ServerCoreEvent::Tracking { poll_timestamp } => {
-                    let headset_config = &alvr_server_core::settings().headset;
+                    // Never wait for a session write while delivering poses.
+                    let settings = alvr_server_core::settings_snapshot();
+                    let headset_config = &settings.headset;
 
                     let controllers_config = headset_config.controllers.clone().into_option();
                     let track_body = headset_config.body_tracking.enabled();
@@ -712,7 +714,8 @@ extern "C" fn wait_for_vsync(throttle_frames: u32) {
         return;
     }
 
-    if alvr_server_core::settings()
+    // Runs on the SteamVR present path: read a snapshot instead of waiting for a session write.
+    if alvr_server_core::settings_snapshot()
         .video
         .enforce_server_frame_pacing
     {
