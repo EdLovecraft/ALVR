@@ -555,6 +555,9 @@ fn stream_input_loop(
     refresh_rate: f32,
     running: Arc<RelaxedAtomic>,
 ) {
+    // Tracking samples feed both the server's game poses and the frames' display timestamps.
+    crate::declare_xr_thread(&xr_session, xr::AndroidThreadTypeKHR::APPLICATION_WORKER);
+
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
     let mut last_view_params = [ViewParams::DUMMY; 2];
