@@ -25,7 +25,14 @@ use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
 use openxr as xr;
 use passthrough::PassthroughLayer;
-use std::{ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
+use std::{
+    ffi::CStr,
+    path::Path,
+    rc::Rc,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 use stream::StreamContext;
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
@@ -644,6 +651,10 @@ pub fn entry_point() {
                 }
             }
 
+            if let Some(stream) = &mut stream_context {
+                stream.report_frame_loop_end();
+            }
+
             let frame_state = match xr_frame_waiter.wait() {
                 Ok(state) => state,
                 Err(e) => {
@@ -651,6 +662,7 @@ pub fn entry_point() {
                     panic!();
                 }
             };
+            let frame_loop_start = Instant::now();
             let frame_interval =
                 Duration::from_nanos(frame_state.predicted_display_period.as_nanos() as _);
             let vsync_time =
@@ -672,7 +684,7 @@ pub fn entry_point() {
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
             let (layer, display_time) = if let Some(stream) = &mut stream_context {
-                stream.render(frame_interval, vsync_time)
+                stream.render(frame_interval, vsync_time, frame_loop_start)
             } else {
                 (lobby.render(vsync_time), vsync_time)
             };

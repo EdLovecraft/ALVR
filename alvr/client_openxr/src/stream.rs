@@ -23,6 +23,7 @@ use alvr_session::{
 use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
+    collections::VecDeque,
     ptr,
     rc::Rc,
     sync::Arc,
@@ -30,26 +31,94 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Time reserved after the frame dequeue for rendering and calling xrEndFrame(). Waiting for a
-// decoded frame must not eat into it: if the layer isn't submitted before the compositor takes
-// over, the frame is shown a cycle late anyway.
-const MIN_RENDER_BUDGET: Duration = Duration::from_millis(6);
+// Time reserved for everything in a frame loop iteration other than waiting for a decoded frame
+// (rendering, xrEndFrame(), event handling), until the loop has been measured.
+const DEFAULT_RENDER_BUDGET: Duration = Duration::from_millis(6);
+// The measured time excludes work the runtime does after xrEndFrame() returns.
+const MIN_RENDER_BUDGET: Duration = Duration::from_millis(3);
+// Slack between the end of an iteration and the next xrWaitFrame() wake-up.
+const RENDER_BUDGET_MARGIN: Duration = Duration::from_millis(1);
+// About one second of iterations. A high percentile follows the slower kind of iteration (a new
+// frame costs more than a repeated one) while ignoring isolated hitches.
+const RENDER_TIME_HISTORY_SIZE: usize = 128;
+const MIN_RENDER_TIME_SAMPLES: usize = 32;
+const RENDER_TIME_QUANTILE: f32 = 0.95;
 
+// Measures how long a frame loop iteration takes apart from the wait for a decoded frame, so that
+// the wait can use the rest of the display period and no more. An iteration runs from the return
+// of xrWaitFrame() to the next call to it.
+struct RenderBudget {
+    samples: VecDeque<Duration>,
+    sorted: Vec<Duration>,
+    // Start of the current iteration and the time it spent waiting for a frame.
+    iteration: Option<(Instant, Duration)>,
+}
+
+impl RenderBudget {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(RENDER_TIME_HISTORY_SIZE),
+            sorted: Vec::with_capacity(RENDER_TIME_HISTORY_SIZE),
+            iteration: None,
+        }
+    }
+
+    fn report_wait(&mut self, iteration_start: Instant, waited: Duration) {
+        self.iteration = Some((iteration_start, waited));
+    }
+
+    // Call right before xrWaitFrame(). Iterations that did not render are not sampled.
+    fn report_iteration_end(&mut self, now: Instant) {
+        if let Some((start, waited)) = self.iteration.take() {
+            if self.samples.len() == RENDER_TIME_HISTORY_SIZE {
+                self.samples.pop_front();
+            }
+            self.samples
+                .push_back(now.saturating_duration_since(start).saturating_sub(waited));
+        }
+    }
+
+    fn get(&mut self) -> Duration {
+        if self.samples.len() < MIN_RENDER_TIME_SAMPLES {
+            return DEFAULT_RENDER_BUDGET;
+        }
+
+        self.sorted.clear();
+        self.sorted.extend(self.samples.iter().copied());
+        let index =
+            ((self.sorted.len() as f32 * RENDER_TIME_QUANTILE) as usize).min(self.sorted.len() - 1);
+        let (_, render_time, _) = self.sorted.select_nth_unstable(index);
+
+        (*render_time + RENDER_BUDGET_MARGIN).max(MIN_RENDER_BUDGET)
+    }
+}
+
+// How long to wait for a decoded frame after xrBeginFrame().
+//
+// The whole iteration has to fit in one display period. xrWaitFrame() paces the loop to the
+// display only as long as it is called before the next wake-up time: an iteration that waits a
+// full period and then still has to render ends after it. The loop then follows the arrival of
+// frames instead of the display, and the end of the wait, which is the deadline the streamer
+// aligns its frames to, is no longer a fixed point of the display cycle.
+//
+// The predicted display time and current time share OpenXR's clock. A display closer than one
+// period is a harder limit than the next wake-up, and the runtime needs time of its own before
+// it: the wait keeps at least the default budget ahead of the display.
 fn decoder_wait_timeout(
     frame_interval: Duration,
     vsync_time: Duration,
     xr_now: Option<Duration>,
+    render_budget: Duration,
 ) -> Duration {
+    let period_bound = frame_interval.saturating_sub(render_budget);
+
     if let Some(now) = xr_now {
-        // The predicted display time and current time share OpenXR's clock. The display period
-        // alone does not tell us how much time remains after xrWaitFrame() and xrBeginFrame().
-        // Bound the wait to one period even if the runtime predicts a display further ahead.
         vsync_time
             .saturating_sub(now)
-            .saturating_sub(MIN_RENDER_BUDGET)
-            .min(frame_interval)
+            .saturating_sub(render_budget.max(DEFAULT_RENDER_BUDGET))
+            .min(period_bound)
     } else {
-        frame_interval.saturating_sub(MIN_RENDER_BUDGET)
+        period_bound
     }
 }
 
@@ -116,6 +185,7 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    render_budget: RenderBudget,
 }
 
 impl StreamContext {
@@ -262,6 +332,7 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
+            render_budget: RenderBudget::new(),
         };
 
         this.update_reference_space();
@@ -357,10 +428,18 @@ impl StreamContext {
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
     }
 
+    /// Call right before xrWaitFrame(), so the time the frame loop needs besides waiting for a
+    /// decoded frame can be measured.
+    pub fn report_frame_loop_end(&mut self) {
+        self.render_budget.report_iteration_end(Instant::now());
+    }
+
+    /// `frame_loop_start` is the time xrWaitFrame() returned for this frame.
     pub fn render(
         &mut self,
         frame_interval: Duration,
         vsync_time: Duration,
+        frame_loop_start: Instant,
     ) -> (ProjectionLayerBuilder<'_>, Duration) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
 
@@ -370,8 +449,10 @@ impl StreamContext {
             frame_interval,
             vsync_time,
             crate::xr_runtime_now(self.xr_session.instance()).map(crate::from_xr_time),
+            self.render_budget.get(),
         );
-        let latch_deadline = Instant::now() + timeout;
+        let wait_start = Instant::now();
+        let latch_deadline = wait_start + timeout;
         let (frame_result, dropped_frames) = match &mut self.decoder {
             Some((_, source)) => (
                 source.get_frame_timeout(timeout),
@@ -379,6 +460,8 @@ impl StreamContext {
             ),
             None => (None, 0),
         };
+        self.render_budget
+            .report_wait(frame_loop_start, wait_start.elapsed());
         // Reported for every refresh, including those without a new frame, so the streamer can
         // place its frames relative to this deadline.
         self.core_context.report_frame_latch(FrameLatch {
@@ -717,62 +800,176 @@ fn stream_input_loop(
 mod tests {
     use super::*;
 
-    #[test]
-    fn decoder_wait_uses_remaining_display_time_at_120_hz() {
-        let frame_interval = Duration::from_secs_f32(1.0 / 120.0);
-        let now = Duration::from_secs(100);
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
 
-        // The same refresh rate can leave different amounts of time after xrWaitFrame().
-        assert_eq!(
-            decoder_wait_timeout(frame_interval, now + Duration::from_millis(8), Some(now)),
-            Duration::from_millis(2)
-        );
-        assert_eq!(
-            decoder_wait_timeout(frame_interval, now + Duration::from_millis(12), Some(now)),
-            Duration::from_millis(6)
-        );
+    fn us(value: u64) -> Duration {
+        Duration::from_micros(value)
     }
 
     #[test]
-    fn decoder_wait_stops_when_only_render_time_remains() {
-        let frame_interval = Duration::from_secs_f32(1.0 / 120.0);
-        let vsync_time = Duration::from_secs(100);
+    fn decoder_wait_leaves_the_render_budget_inside_the_display_period() {
+        let now = Duration::from_secs(100);
 
-        for now in [
-            vsync_time - Duration::from_millis(6),
-            vsync_time - Duration::from_millis(4),
-            vsync_time,
-            vsync_time + Duration::from_millis(4),
+        // The display is predicted more than two periods ahead, as on runtimes that reserve a
+        // period for their own compositor. That does not leave more than a period to the loop.
+        for (frame_interval, budget, expected) in [
+            (us(8_333), ms(3), us(5_333)),
+            (us(8_333), ms(6), us(2_333)),
+            (us(11_111), ms(4), us(7_111)),
+            (us(13_889), ms(6), us(7_889)),
         ] {
             assert_eq!(
-                decoder_wait_timeout(frame_interval, vsync_time, Some(now)),
-                Duration::ZERO
+                decoder_wait_timeout(frame_interval, now + ms(30), Some(now), budget),
+                expected
             );
         }
     }
 
     #[test]
-    fn decoder_wait_is_bounded_when_display_is_far_ahead() {
-        let frame_interval = Duration::from_secs_f32(1.0 / 120.0);
+    fn decoder_wait_uses_the_remaining_display_time_when_it_is_shorter() {
+        let frame_interval = us(8_333);
         let now = Duration::from_secs(100);
 
+        // The same refresh rate can leave different amounts of time after xrWaitFrame(). The
+        // default budget is kept before the display even when the loop needs less.
         assert_eq!(
-            decoder_wait_timeout(frame_interval, now + frame_interval * 3, Some(now)),
-            frame_interval
+            decoder_wait_timeout(frame_interval, now + ms(5), Some(now), ms(3)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            decoder_wait_timeout(frame_interval, now + ms(8), Some(now), ms(3)),
+            ms(2)
+        );
+        assert_eq!(
+            decoder_wait_timeout(frame_interval, now + ms(12), Some(now), ms(3)),
+            us(5_333)
+        );
+        // A loop that needs more than the default keeps that before the display.
+        assert_eq!(
+            decoder_wait_timeout(ms(20), now + ms(12), Some(now), ms(8)),
+            ms(4)
         );
     }
 
     #[test]
-    fn decoder_wait_preserves_the_fallback_without_runtime_time() {
+    fn decoder_wait_stops_when_only_render_time_remains() {
+        let frame_interval = us(8_333);
         let vsync_time = Duration::from_secs(100);
 
+        for now in [
+            vsync_time - ms(6),
+            vsync_time - ms(4),
+            vsync_time,
+            vsync_time + ms(4),
+        ] {
+            assert_eq!(
+                decoder_wait_timeout(frame_interval, vsync_time, Some(now), ms(6)),
+                Duration::ZERO
+            );
+        }
+
+        // A budget longer than the period leaves a single non-blocking dequeue attempt.
         assert_eq!(
-            decoder_wait_timeout(Duration::from_millis(10), vsync_time, None),
-            Duration::from_millis(4)
-        );
-        assert_eq!(
-            decoder_wait_timeout(Duration::from_millis(4), vsync_time, None),
+            decoder_wait_timeout(frame_interval, vsync_time, Some(vsync_time - ms(30)), ms(9)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn decoder_wait_uses_the_period_without_runtime_time() {
+        let vsync_time = Duration::from_secs(100);
+
+        assert_eq!(decoder_wait_timeout(ms(10), vsync_time, None, ms(6)), ms(4));
+        assert_eq!(
+            decoder_wait_timeout(ms(4), vsync_time, None, ms(6)),
+            Duration::ZERO
+        );
+    }
+
+    // One iteration that waited `waited` for a frame and needed `work` for everything else.
+    fn iteration(budget: &mut RenderBudget, start: Instant, waited: Duration, work: Duration) {
+        budget.report_wait(start, waited);
+        budget.report_iteration_end(start + waited + work);
+    }
+
+    #[test]
+    fn render_budget_starts_from_the_default() {
+        let start = Instant::now();
+        let mut budget = RenderBudget::new();
+        assert_eq!(budget.get(), DEFAULT_RENDER_BUDGET);
+
+        for _ in 0..MIN_RENDER_TIME_SAMPLES - 1 {
+            iteration(&mut budget, start, ms(2), ms(4));
+        }
+        assert_eq!(budget.get(), DEFAULT_RENDER_BUDGET);
+
+        iteration(&mut budget, start, ms(2), ms(4));
+        assert_eq!(budget.get(), ms(4) + RENDER_BUDGET_MARGIN);
+    }
+
+    #[test]
+    fn render_budget_excludes_the_wait_for_a_frame() {
+        let start = Instant::now();
+        let mut budget = RenderBudget::new();
+
+        // However long the wait, the work after it takes the same time.
+        for frame in 0..RENDER_TIME_HISTORY_SIZE as u64 {
+            iteration(&mut budget, start, us(frame * 50), us(4_500));
+        }
+
+        assert_eq!(budget.get(), us(4_500) + RENDER_BUDGET_MARGIN);
+    }
+
+    #[test]
+    fn render_budget_follows_the_slower_iterations_but_not_hitches() {
+        let start = Instant::now();
+        let mut budget = RenderBudget::new();
+
+        // Three in four iterations repeat the previous frame, which is cheaper to render. A
+        // decoder restart stalls a few iterations.
+        for frame in 0..RENDER_TIME_HISTORY_SIZE {
+            let work = match frame {
+                40..43 => ms(150),
+                _ if frame % 4 == 0 => us(5_200),
+                _ => us(3_400),
+            };
+            iteration(&mut budget, start, Duration::ZERO, work);
+        }
+
+        assert_eq!(budget.get(), us(5_200) + RENDER_BUDGET_MARGIN);
+    }
+
+    #[test]
+    fn render_budget_has_a_floor_and_forgets_old_iterations() {
+        let start = Instant::now();
+        let mut budget = RenderBudget::new();
+
+        for _ in 0..RENDER_TIME_HISTORY_SIZE {
+            iteration(&mut budget, start, Duration::ZERO, ms(7));
+        }
+        assert_eq!(budget.get(), ms(7) + RENDER_BUDGET_MARGIN);
+
+        for _ in 0..RENDER_TIME_HISTORY_SIZE {
+            iteration(&mut budget, start, Duration::ZERO, us(500));
+        }
+        assert_eq!(budget.get(), MIN_RENDER_BUDGET);
+    }
+
+    #[test]
+    fn iterations_that_did_not_render_are_not_sampled() {
+        let start = Instant::now();
+        let mut budget = RenderBudget::new();
+
+        for _ in 0..MIN_RENDER_TIME_SAMPLES {
+            iteration(&mut budget, start, Duration::ZERO, ms(4));
+        }
+        // The runtime asked not to render for a while: only xrWaitFrame() calls in between.
+        budget.report_iteration_end(start + Duration::from_secs(5));
+        budget.report_iteration_end(start + Duration::from_secs(6));
+
+        assert_eq!(budget.samples.len(), MIN_RENDER_TIME_SAMPLES);
+        assert_eq!(budget.get(), ms(4) + RENDER_BUDGET_MARGIN);
     }
 }

@@ -776,3 +776,270 @@ mod closed_loop_tests {
         assert!((last_reported_margin(&locked) - 0.001).abs() < 0.0001);
     }
 }
+
+// The closed loop above latches on a fixed display grid. This one also models what moves the
+// latch deadline of the client: its frame loop. xrWaitFrame() wakes the loop on the display grid,
+// the loop waits a bounded time for a decoded frame, renders, and has to call xrWaitFrame() again
+// before the next wake-up. The compositor shows the newest submitted frame once per refresh.
+#[cfg(test)]
+mod client_loop_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    const INTERVAL: Duration = Duration::from_nanos(8_333_333);
+    // The headset clock runs 100 ppm slower than the streamer clock.
+    const DISPLAY_PERIOD: Duration = Duration::from_nanos(8_334_166);
+    const GAME_RENDER: Duration = Duration::from_millis(4);
+    const TRANSPORT: Duration = Duration::from_millis(20);
+    const MAX_JITTER: Duration = Duration::from_micros(600);
+    const TARGET_MARGIN: Duration = Duration::from_millis(1);
+    const SETTLING_TIME: f32 = 20.0;
+
+    // What xrWaitFrame() does when it is called after the wake-up time it would have returned at.
+    #[derive(Clone, Copy, Debug)]
+    enum LateWakeUp {
+        // Returns at once: the loop keeps running, shifted against the display.
+        AtOnce,
+        // Returns at the following wake-up: the loop stays on the grid and loses a refresh.
+        NextRefresh,
+    }
+
+    struct Run {
+        // (seconds since start, reported 2nd percentile margin)
+        reported_margins: Vec<(f32, f32)>,
+        // Refreshes that showed the previous frame again, in seconds since start
+        display_repeats: Vec<f32>,
+        // Refreshes that received more than one frame, of which only the newest is shown
+        display_skips: Vec<f32>,
+        // Iterations that called xrWaitFrame() after its wake-up time
+        late_iterations: Vec<f32>,
+    }
+
+    impl Run {
+        fn settled(times: &[f32]) -> usize {
+            times.iter().filter(|time| **time > SETTLING_TIME).count()
+        }
+
+        fn settled_margins(&self) -> impl Iterator<Item = f32> + '_ {
+            self.reported_margins
+                .iter()
+                .filter(|(time, _)| *time > SETTLING_TIME)
+                .map(|(_, margin)| *margin)
+        }
+    }
+
+    struct Jitter(u64);
+
+    impl Jitter {
+        fn next(&mut self) -> Duration {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+
+            MAX_JITTER.mul_f64((self.0 >> 33) as f64 / (1_u64 << 31) as f64)
+        }
+    }
+
+    fn signed_seconds(deadline: Instant, ready: Instant) -> f32 {
+        if deadline >= ready {
+            (deadline - ready).as_secs_f32()
+        } else {
+            -(ready - deadline).as_secs_f32()
+        }
+    }
+
+    // `max_wait` is the longest the client waits for a decoded frame, `render` the time from the
+    // end of that wait to its next xrWaitFrame() call. Game and transport times both jitter.
+    fn simulate(late_wake_up: LateWakeUp, max_wait: Duration, render: Duration) -> Run {
+        let start = Instant::now();
+        let end = start + Duration::from_secs(60);
+        let since_start = |time: Instant| (time - start).as_secs_f32();
+        let mut jitter = Jitter(1);
+
+        // Streamer
+        let mut pacer = FramePacer::new_at(INTERVAL, start);
+        let mut release = start;
+        let mut reports_in_flight = VecDeque::<(Instant, Option<f32>)>::new();
+        let mut frames_in_flight = VecDeque::<(Instant, u64)>::new();
+        let mut next_frame = 0;
+
+        // Client
+        let wake_up = |slot: u32| start + Duration::from_millis(3) + DISPLAY_PERIOD * slot;
+        let mut slot = 0;
+        let mut wait_frame_call = start;
+        let mut decoded = VecDeque::<(Instant, u64)>::new();
+        let mut first_missed_deadline = None;
+        let mut consecutive_repeats = 0;
+        let mut latched_frames = 0;
+        let mut margins = VecDeque::<(Instant, f32)>::new();
+        let mut next_report = start + Duration::from_millis(250);
+        // (xrEndFrame() time, frame)
+        let mut submissions = Vec::<(Instant, u64)>::new();
+
+        let mut run = Run {
+            reported_margins: vec![],
+            display_repeats: vec![],
+            display_skips: vec![],
+            late_iterations: vec![],
+        };
+
+        loop {
+            // Where the next client iteration starts. Wake-ups it is too late for are lost.
+            let mut next_slot = slot;
+            while wake_up(next_slot + 1) <= wait_frame_call {
+                next_slot += 1;
+            }
+            let late = wait_frame_call > wake_up(next_slot);
+            if late && matches!(late_wake_up, LateWakeUp::NextRefresh) {
+                next_slot += 1;
+            }
+            let iteration_start = wait_frame_call.max(wake_up(next_slot));
+
+            // The earlier of the next streamer frame and the next client iteration.
+            if release + GAME_RENDER <= iteration_start {
+                let ready = release + GAME_RENDER + jitter.next();
+                if ready >= end {
+                    break;
+                }
+                while reports_in_flight
+                    .front()
+                    .is_some_and(|(arrival, _)| *arrival <= ready)
+                {
+                    let (arrival, low) = reports_in_flight.pop_front().unwrap();
+                    pacer.report_client_timing(DISPLAY_PERIOD, low, Some(TARGET_MARGIN), arrival);
+                }
+                frames_in_flight.push_back((ready + TRANSPORT + jitter.next(), next_frame));
+                next_frame += 1;
+                release = ready + pacer.claim_next_vsync_slot_at(0, ready);
+
+                continue;
+            }
+
+            if late {
+                run.late_iterations.push(since_start(iteration_start));
+            }
+            slot = next_slot + 1;
+
+            let deadline = iteration_start + max_wait;
+            while frames_in_flight
+                .front()
+                .is_some_and(|(arrival, _)| *arrival <= deadline)
+            {
+                decoded.push_back(frames_in_flight.pop_front().unwrap());
+            }
+
+            let wait_end = if let Some((ready, frame)) = decoded.pop_front() {
+                let wait_end = ready.max(iteration_start);
+                let reference = first_missed_deadline.take().unwrap_or(deadline);
+                if std::mem::take(&mut consecutive_repeats) <= 3 {
+                    let bound = 2.0 * DISPLAY_PERIOD.as_secs_f32();
+                    let margin = signed_seconds(reference, ready).clamp(-bound, bound);
+                    margins.push_back((wait_end, margin));
+                }
+                latched_frames += 1;
+                submissions.push((wait_end + render, frame));
+
+                wait_end
+            } else {
+                consecutive_repeats += 1;
+                if latched_frames > 0 {
+                    first_missed_deadline.get_or_insert(deadline);
+                }
+
+                deadline
+            };
+
+            while margins
+                .front()
+                .is_some_and(|(time, _)| wait_end - *time > Duration::from_secs(1))
+            {
+                margins.pop_front();
+            }
+            if wait_end >= next_report {
+                next_report = wait_end + Duration::from_millis(250);
+                let low = (margins.len() >= 20).then(|| {
+                    let mut sorted = margins.iter().map(|(_, m)| *m).collect::<Vec<_>>();
+                    sorted.sort_by(f32::total_cmp);
+                    sorted[(sorted.len() as f32 * 0.02) as usize]
+                });
+                if let Some(low) = low {
+                    run.reported_margins.push((since_start(wait_end), low));
+                }
+                reports_in_flight.push_back((wait_end + Duration::from_millis(2), low));
+            }
+
+            wait_frame_call = wait_end + render;
+        }
+
+        // The compositor takes the newest frame submitted by each wake-up time.
+        let mut submissions = submissions.into_iter().peekable();
+        let mut showing_a_frame = false;
+        for slot in 1.. {
+            let latch = wake_up(slot);
+            if latch >= end {
+                break;
+            }
+
+            let mut new_frames = 0;
+            while submissions.next_if(|(time, _)| *time <= latch).is_some() {
+                new_frames += 1;
+            }
+            match new_frames {
+                0 if showing_a_frame => run.display_repeats.push(since_start(latch)),
+                0 => (),
+                1 => showing_a_frame = true,
+                _ => run.display_skips.push(since_start(latch)),
+            }
+        }
+
+        run
+    }
+
+    #[test]
+    fn phase_lock_settles_when_the_client_frame_loop_fits_in_the_display_period() {
+        for late_wake_up in [LateWakeUp::AtOnce, LateWakeUp::NextRefresh] {
+            // 3 ms to render, and a wait that leaves 4 ms of the period for it.
+            let run = simulate(
+                late_wake_up,
+                DISPLAY_PERIOD - Duration::from_millis(4),
+                Duration::from_millis(3),
+            );
+
+            for margin in run.settled_margins() {
+                assert!(
+                    (margin - TARGET_MARGIN.as_secs_f32()).abs() < 0.0003,
+                    "{late_wake_up:?}: margin {margin}"
+                );
+            }
+            assert!(run.settled_margins().count() > 100);
+            assert_eq!(Run::settled(&run.late_iterations), 0, "{late_wake_up:?}");
+            assert_eq!(Run::settled(&run.display_repeats), 0, "{late_wake_up:?}");
+            assert_eq!(Run::settled(&run.display_skips), 0, "{late_wake_up:?}");
+        }
+    }
+
+    // Why the client must keep its render time inside the display period: if it waits a whole
+    // period and then renders, it calls xrWaitFrame() late. Its next deadline then follows the
+    // previous frame instead of the display, so the margin it reports no longer depends on the
+    // phase of the grid. The grid is steered without ever reaching the target, and frames keep
+    // crossing the compositor latch.
+    #[test]
+    fn a_client_frame_loop_longer_than_the_display_period_cannot_be_locked() {
+        for late_wake_up in [LateWakeUp::AtOnce, LateWakeUp::NextRefresh] {
+            let run = simulate(late_wake_up, DISPLAY_PERIOD, Duration::from_millis(3));
+
+            for margin in run.settled_margins() {
+                assert!(
+                    margin > TARGET_MARGIN.as_secs_f32() + 0.0005,
+                    "{late_wake_up:?}: margin {margin}"
+                );
+            }
+            assert!(
+                Run::settled(&run.display_repeats) > 5,
+                "{late_wake_up:?}: {} repeats",
+                Run::settled(&run.display_repeats)
+            );
+        }
+    }
+}
